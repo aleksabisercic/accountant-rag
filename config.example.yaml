@@ -1,0 +1,27 @@
+agent:
+  model: claude-sonnet-4-6
+  max_tool_rounds: 5
+
+retrieval:
+  top_k: 5
+  chunk_size: 2000
+  chunk_overlap: 0
+  embedding_dimensions: 1024
+  collection_name: accountant_docs
+
+telegram:
+  allowed_chat_ids: []    # Empty = allow all. Set for production
+  admin_chat_ids: []      # Who can upload PDFs via Telegram
+  rate_limit_window: 60   # seconds
+  rate_limit_max: 10      # messages per window
+  max_message_length: 4000
+  max_pdf_size_mb: 20
+  inactive_ttl_minutes: 60
+
+contextual_embeddings:
+  enabled: false                      # Set true to contextualize chunks during ingestion
+  model: claude-haiku-4-5-20251001    # Haiku is cheapest (~$3.50 for 200 docs)
+  max_concurrent: 5                   # Parallel LLM calls per document
+
+health:
+  port: 8080

@@ -1,0 +1,9 @@
+.env
+data/pdfs/
+data/analytics.db
+data/analytics.db-wal
+data/analytics.db-shm
+__pycache__/
+*.pyc
+.venv/
+data/review/
