@@ -4,7 +4,7 @@ import logging
 import re
 import time
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -31,7 +31,7 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 
 from src import acl, vector_store
 from src.agent import AgentResponse, Source, run as agent_run
-from src.analytics import get_stats, log_escalation, log_query
+from src.analytics import get_recent_questions, get_stats, log_escalation, log_query
 from src.config import CONFIG, TELEGRAM_BOT_TOKEN
 from src.embeddings import embed_documents
 from src.contextualizer import contextualize_chunks
@@ -70,6 +70,7 @@ _ADMIN_COMMANDS = _USER_COMMANDS + [
     BotCommand("addadmin", "Dodaj admina"),
     BotCommand("removeadmin", "Ukloni admina"),
     BotCommand("stats", "Statistika korišćenja"),
+    BotCommand("pitanja", "Lista pitanja iz prethodnog perioda"),
     BotCommand("broadcast", "Pošalji obaveštenje svima"),
 ]
 
@@ -271,28 +272,11 @@ def _md_to_html(text: str) -> str:
 
 
 def _format_sources(sources: list[Source]) -> str:
-    """Format source citations as ready-to-use HTML (appended after conversion)."""
-    doc_labels = []
-    web_labels = []
-    for s in sources:
-        if s.type == "document":
-            doc_labels.append(html.escape(s.name))
-        else:
-            try:
-                domain = s.url.split("/")[2] if s.url else s.name
-            except IndexError:
-                domain = s.url or s.name
-            if s.url:
-                web_labels.append(
-                    f'<a href="{html.escape(s.url)}">{html.escape(domain)}</a>'
-                )
-            else:
-                web_labels.append(html.escape(s.name))
-    lines = []
-    for label in doc_labels:
-        lines.append(f"📄 {label}")
-    for label in web_labels:
-        lines.append(f"🌐 {label}")
+    """Format document citations as ready-to-use HTML (appended after conversion).
+
+    Web links are intentionally omitted — client asked to hide them from replies.
+    """
+    lines = [f"📄 {html.escape(s.name)}" for s in sources if s.type == "document"]
     return "\n\n" + "\n".join(lines) if lines else ""
 
 
@@ -522,6 +506,7 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         lines.append("/addadmin &lt;ID&gt; [ime] — Dodaj admina")
         lines.append("/removeadmin &lt;ID&gt; — Ukloni admina")
         lines.append("/stats [dana] — Statistika (podrazumevano 7 dana)")
+        lines.append("/pitanja [dana] — Lista pitanja (podrazumevano 7 dana, max 90)")
         lines.append("/broadcast &lt;poruka&gt; — Pošalji obaveštenje svim korisnicima")
         lines.append("\n📄 Pošaljite PDF fajl da biste ga dodali u bazu znanja.")
 
@@ -867,6 +852,79 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("Greska pri ucitavanju statistike.")
 
 
+_QUESTION_PREVIEW_MAX = 200
+
+
+def _format_questions_digest(rows: list[dict], days: int) -> str:
+    """Render a list of questions as HTML bullets: '<pitanje> (<korisnik>)'."""
+    header = f"<b>Pitanja u poslednjih {days} dana ({len(rows)}):</b>"
+    if not rows:
+        return header + "\n\nNema pitanja u ovom periodu."
+
+    lines = [header, ""]
+    for r in rows:
+        msg = r["user_message"] or ""
+        if len(msg) > _QUESTION_PREVIEW_MAX:
+            msg = msg[:_QUESTION_PREVIEW_MAX] + "…"
+        name = acl.get_name(r["chat_id"]) or f"ID {r['chat_id']}"
+        lines.append(f"• {html.escape(msg)} (<i>{html.escape(name)}</i>)")
+    return "\n".join(lines)
+
+
+async def pitanja_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only /pitanja [dana] — list questions from the last N days."""
+    chat_id = update.effective_chat.id
+    if not _is_admin(chat_id):
+        await update.message.reply_text("Nemate pristup ovoj komandi.")
+        return
+
+    days = 7
+    if context.args:
+        try:
+            days = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("Broj dana mora biti ceo broj (1-90).")
+            return
+        if days < 1 or days > 90:
+            await update.message.reply_text("Broj dana mora biti između 1 i 90.")
+            return
+
+    try:
+        rows = await get_recent_questions(days=days)
+    except Exception:
+        logger.exception("Error fetching questions for chat_id=%s", chat_id)
+        await update.message.reply_text("Greška pri učitavanju pitanja.")
+        return
+
+    text = _format_questions_digest(rows, days)
+    for chunk in _split_html(text, 4096):
+        try:
+            await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
+        except Exception:
+            await update.message.reply_text(chunk)
+
+
+async def _weekly_questions_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send last-week question list to all admins. Monday 09:00 Europe/Belgrade."""
+    try:
+        rows = await get_recent_questions(days=7)
+        text = _format_questions_digest(rows, 7)
+        chunks = _split_html(text, 4096)
+        for admin_id in acl.get_admins():
+            for chunk in chunks:
+                try:
+                    await context.bot.send_message(
+                        chat_id=admin_id, text=chunk, parse_mode=ParseMode.HTML
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to send weekly questions to admin %s", admin_id
+                    )
+                    break
+    except Exception:
+        logger.exception("Error generating weekly questions digest")
+
+
 async def _weekly_digest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send weekly digest to all admins. Scheduled for Monday 09:00 Belgrade time."""
     try:
@@ -939,6 +997,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("addadmin", addadmin_handler))
     app.add_handler(CommandHandler("removeadmin", removeadmin_handler))
     app.add_handler(CommandHandler("dokumenti", dokumenti_handler))
+    app.add_handler(CommandHandler("pitanja", pitanja_handler))
     app.add_handler(CommandHandler("broadcast", broadcast_handler))
     app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
@@ -947,5 +1006,12 @@ def build_app() -> Application:
     job_queue = app.job_queue
     if job_queue is not None:
         job_queue.run_repeating(_sweep_job, interval=3600, first=3600, name="sweep_inactive")
+        # Monday 09:00 Europe/Belgrade — PTB uses Monday=0 in days tuple.
+        job_queue.run_daily(
+            _weekly_questions_job,
+            time=dtime(hour=9, minute=0, tzinfo=ZoneInfo("Europe/Belgrade")),
+            days=(0,),
+            name="weekly_questions",
+        )
 
     return app

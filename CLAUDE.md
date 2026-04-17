@@ -55,18 +55,20 @@ Two entry points: `bot.py` (Telegram bot + health server + Qdrant keepalive) and
 - Polling mode, per-chat history in memory (max 5 exchanges, lost on restart). Periodic sweep (hourly) evicts entries idle > `inactive_ttl_minutes` (default 60).
 - ACL via `src/acl.py` → `data/acl.json`. `allowed_chat_ids` (empty = allow all), `admin_chat_ids` (PDF upload + /stats + user management).
 - **Bot profile** set at startup via `_post_init`: short description, empty-chat description (registration prompt), and scoped command menus.
-- **Scoped command menus**: `_USER_COMMANDS` (4 commands) shown to all users, `_ADMIN_COMMANDS` (11 commands) shown per-admin via `BotCommandScopeChat`. Refreshed on `/addadmin` (set) and `/removeadmin` (delete, falls back to default). All API failures are non-fatal (warning log, bot continues).
+- **Scoped command menus**: `_USER_COMMANDS` (4 commands) shown to all users, `_ADMIN_COMMANDS` (12 commands) shown per-admin via `BotCommandScopeChat`. Refreshed on `/addadmin` (set) and `/removeadmin` (delete, falls back to default). All API failures are non-fatal (warning log, bot continues).
 - `/start` — welcome + Chat ID for onboarding. `/clear` — reset chat history. `/adduser`, `/removeuser`, `/users`, `/addadmin`, `/removeadmin` — admin-only. Self-removal as admin blocked.
 - `/dokumenti` — lists indexed PDFs from Qdrant. All users see filenames; admins also see chunk counts. Uses `_split_html` for long lists.
 - `/broadcast <msg>` — admin-only. Rejects messages >4096 chars. Runs via `asyncio.create_task` (non-blocking). Sends to all users+admins (deduplicated), HTML with plain text fallback, `Forbidden` tracked separately. Admin gets interim "⏳" then final summary.
 - Escalation detection: after `agent_run()`, checks if response contains `_ESCALATION_MARKER` (lowercased match against the exact system prompt phrase). On match: fire-and-forget `log_escalation()` + `_notify_admins_escalation()` (sends user question + bot response preview to all admins).
 - Admin PDF upload: download → read page count (PyMuPDF) → extract → chunk → hard-block if `len(chunks) > _MAX_CHUNKS` (600, rejects before embedding spend) → embed → delete old vectors by filename → upsert. Distinct error branches: scanned PDF, empty extraction, chunk overflow, Qdrant quota (`UnexpectedResponse` with status 403/507 or body containing "quota"/"storage") → "Qdrant skladište je puno" message, generic fallback. Success message appends a soft page-count warning when `page_count > _PAGE_WARN_THRESHOLD` (50). Thresholds are module constants near `_MAX_PDF_SIZE_MB` — tune there.
 - `/stats [days]` — admin analytics.
+- `/pitanja [days]` — admin-only. Lists every user question from the last N days (default 7, max 90) as `• <pitanje> (<ime or ID ...>)`. Uses `_split_html` for long lists. Questions truncated at `_QUESTION_PREVIEW_MAX` (200 chars). Also sent automatically every Monday 09:00 Europe/Belgrade by `_weekly_questions_job` (registered via `JobQueue.run_daily`, `days=(0,)`).
 - Markdown → HTML conversion. `_split_html` splits at 4096 chars respecting HTML tag boundaries.
 
 ### Analytics (`src/analytics.py`)
 - SQLite with WAL mode at `data/analytics.db`. Fire-and-forget query logging.
 - `get_stats(days)` returns: question_count, unique_users, escalation_count, recent_escalations (last 5, newest first with timestamps), avg_response_time, week-over-week change.
+- `get_recent_questions(days)` returns list of `{chat_id, user_message, created_at}` for the last N days, ordered ASC. Powers `/pitanja` and the weekly questions job.
 - `log_escalation()` is wired up — triggered when Claude's response contains the escalation marker phrase. Logs to `escalations` table (reason truncated to 50 chars) and notifies all admins via Telegram with user question + bot response preview (500 chars).
 - `update_daily_stats()` exists but is not wired up — dead code. `get_stats()` queries live, making it unnecessary at current volume.
 
