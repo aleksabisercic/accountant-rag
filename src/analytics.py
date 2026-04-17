@@ -153,6 +153,22 @@ async def get_stats(days: int = 7) -> dict:
         }
 
 
+async def get_recent_questions(days: int) -> list[dict]:
+    """Return all user questions from the last N days, oldest first."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        rows = await db.execute_fetchall(
+            """SELECT chat_id, user_message, created_at
+               FROM queries WHERE created_at >= ?
+               ORDER BY created_at ASC""",
+            (cutoff,),
+        )
+        return [
+            {"chat_id": r[0], "user_message": r[1], "created_at": r[2]}
+            for r in rows
+        ]
+
+
 async def update_daily_stats(date: str) -> None:
     """Aggregate queries/escalations into daily_stats for the given date (YYYY-MM-DD)."""
     try:
