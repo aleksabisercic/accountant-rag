@@ -271,28 +271,11 @@ def _md_to_html(text: str) -> str:
 
 
 def _format_sources(sources: list[Source]) -> str:
-    """Format source citations as ready-to-use HTML (appended after conversion)."""
-    doc_labels = []
-    web_labels = []
-    for s in sources:
-        if s.type == "document":
-            doc_labels.append(html.escape(s.name))
-        else:
-            try:
-                domain = s.url.split("/")[2] if s.url else s.name
-            except IndexError:
-                domain = s.url or s.name
-            if s.url:
-                web_labels.append(
-                    f'<a href="{html.escape(s.url)}">{html.escape(domain)}</a>'
-                )
-            else:
-                web_labels.append(html.escape(s.name))
-    lines = []
-    for label in doc_labels:
-        lines.append(f"📄 {label}")
-    for label in web_labels:
-        lines.append(f"🌐 {label}")
+    """Format document citations as ready-to-use HTML (appended after conversion).
+
+    Web links are intentionally omitted — client asked to hide them from replies.
+    """
+    lines = [f"📄 {html.escape(s.name)}" for s in sources if s.type == "document"]
     return "\n\n" + "\n".join(lines) if lines else ""
 
 
