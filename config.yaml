@@ -1,6 +1,6 @@
 agent:
   model: claude-sonnet-4-6
-  max_tool_rounds: 5
+  max_tool_rounds: 6
 
 retrieval:
   top_k: 10

@@ -25,12 +25,14 @@ Two entry points: `bot.py` (Telegram bot + health server + Qdrant keepalive) and
 
 ### Agent (`src/agent.py`)
 - Claude tool-use loop, max rounds controlled by `config.yaml` `agent.max_tool_rounds`.
-- Three tools: `search_documents` (custom: embed query via Cohere → Qdrant vector search), `code_execution` (Anthropic server-side sandbox: `code_execution_20250825`, Python 3.11 with numpy/scipy/pandas/sympy, no network, no local resource cost), and `web_search` (`web_search_20260209`, Claude native, max 3 uses). Code execution is free when paired with web_search.
+- Two declared tools: `search_documents` (custom: embed query via Cohere → Qdrant vector search) and `web_search` (`web_search_20260209`, Claude native, max 3 uses). Code execution is **auto-injected** by the API when `web_search_20260209` is present — do NOT declare it explicitly or the API returns 400 ("Auto-injecting tools would conflict with existing tool names"). The auto-injected code execution is general-purpose (math, data analysis), not limited to web search filtering. Free when paired with web_search.
 - `agent.run(messages: list[dict]) → AgentResponse(text, sources, web_search_used, tools_used, input_tokens, output_tokens, rounds)`. Decoupled from frontend.
 - Server-side tools (code_execution, web_search) are handled by the API — their results arrive in `response.content` as `server_tool_use` / `*_tool_result` blocks, no `tool_result` message needed. Only `search_documents` requires client-side handling.
+- **Server-side tool block types**: `server_tool_use` blocks have `name` = `"bash_code_execution"` | `"text_editor_code_execution"` | `"web_search"` (never `"code_execution"` directly). Result blocks: `bash_code_execution_tool_result`, `text_editor_code_execution_tool_result`, `web_search_tool_result`. All code execution sub-tool names are normalized to `"code_execution"` in `tools_used` tracking. Both the `end_turn` and non-`end_turn` code paths must scan for these blocks — server-side tools complete within a single API response and return `end_turn`.
 - `pause_turn` stop reason: code execution may pause for long-running turns — the loop sends a continuation message to resume.
 - Chat history annotation: `tools_used` list is appended as `[Korišćeni alati: ...]` to the assistant message stored in `_chat_history` (for Claude context on follow-ups), but never sent to Telegram. The reply to Telegram always uses clean `result.text`.
-- Retry with exponential backoff on Anthropic rate limit / 500 / connection errors.
+- System prompt has date/time injected at load time (`_load_system_prompt()` appends current Belgrade datetime).
+- Retry via SDK built-in `max_retries=5` on the `AsyncAnthropic` client.
 
 ### Ingestion (`src/pdf_loader.py` → `src/embeddings.py` → `src/vector_store.py`)
 1. PyMuPDF4LLM extracts PDF → Markdown. Scanned/image PDFs raise `ScannedPDFError` (no OCR).
@@ -54,12 +56,21 @@ Two entry points: `bot.py` (Telegram bot + health server + Qdrant keepalive) and
 - Mutations persist immediately — no restart needed to add/remove users or admins.
 - Admins are implicitly allowed — no need to also add them to `allowed_chat_ids`.
 
+### Invites & Registrations (`src/invites.py`)
+- JSON-backed store at `data/invites.json`. Same atomic tmp→rename persistence as `acl.py`. Three sections: `pending` (invite tokens), `used` (consumed tokens — audit trail, pruned after 30 days), `registrations` (pending approval requests, pruned after 24h).
+- **Invite tokens (Flow B):** `create(label, created_by, ttl_days=7) → token` — `secrets.token_urlsafe(16)` (128-bit). `consume(token, chat_id) → dict | None` — atomic pop+expiry check under single-threaded asyncio.
+- **Registrations (Flow A):** `add_registration(chat_id, name, company) → bool` (False if already pending — rate limit). `get_registration(chat_id)`, `resolve_registration(chat_id, approved_by)`, `remove_registration(chat_id)`. One pending per chat_id.
+
 ### Telegram Handler (`src/telegram_handler.py`)
 - Polling mode, per-chat history in memory (max 5 exchanges, lost on restart). Periodic sweep (hourly) evicts entries idle > `inactive_ttl_minutes` (default 60).
 - ACL via `src/acl.py` → `data/acl.json`. `allowed_chat_ids` (empty = allow all), `admin_chat_ids` (PDF upload + /stats + user management).
 - **Bot profile** set at startup via `_post_init`: short description, empty-chat description (registration prompt), and scoped command menus.
-- **Scoped command menus**: `_USER_COMMANDS` (4 commands) shown to all users, `_ADMIN_COMMANDS` (12 commands) shown per-admin via `BotCommandScopeChat`. Refreshed on `/addadmin` (set) and `/removeadmin` (delete, falls back to default). All API failures are non-fatal (warning log, bot continues).
-- `/start` — welcome + Chat ID for onboarding. `/clear` — reset chat history. `/adduser`, `/removeuser`, `/users`, `/addadmin`, `/removeadmin` — admin-only. Self-removal as admin blocked.
+- **Scoped command menus**: `_USER_COMMANDS` (4 commands) shown to all users, `_ADMIN_COMMANDS` (13 commands) shown per-admin via `BotCommandScopeChat`. Refreshed on `/addadmin` (set) and `/removeadmin` (delete, falls back to default). All API failures are non-fatal (warning log, bot continues).
+- **Onboarding** — three paths, all converging on `acl.add_user()`:
+  - **Flow B (invite link, preferred):** admin runs `/invite <name, company>` → bot returns `t.me/<bot>?start=<token>` (7-day, single-use). Client taps link → `invites.consume()` → auto-approved. Admin notified via `_notify_admins_invite_used()`.
+  - **Flow A (registration form, fallback):** stranger sends `/start` without token → bot asks name → asks company → `invites.add_registration()` → admins get inline ✅/❌ buttons via `_notify_admins_registration()` + `CallbackQueryHandler`. Approve calls `acl.add_user()`, deny notifies user. One pending per chat_id. Messages during PENDING get "zahtev na čekanju" response. In-memory form state (`_registration_state` dict) evicted after 30 min by `_sweep_inactive()`.
+  - **Manual:** admin runs `/adduser <ID> [name]` directly (existing, unchanged).
+- `/clear` — reset chat history. `/adduser`, `/removeuser`, `/users`, `/addadmin`, `/removeadmin` — admin-only. Self-removal as admin blocked.
 - `/dokumenti` — lists indexed PDFs from Qdrant. All users see filenames; admins also see chunk counts. Uses `_split_html` for long lists.
 - `/broadcast <msg>` — admin-only. Rejects messages >4096 chars. Runs via `asyncio.create_task` (non-blocking). Sends to all users+admins (deduplicated), HTML with plain text fallback, `Forbidden` tracked separately. Admin gets interim "⏳" then final summary.
 - Escalation detection: after `agent_run()`, checks if response contains `_ESCALATION_MARKER` (lowercased match against the exact system prompt phrase). On match: fire-and-forget `log_escalation()` + `_notify_admins_escalation()` (sends user question + bot response preview to all admins).
@@ -94,7 +105,7 @@ Two entry points: `bot.py` (Telegram bot + health server + Qdrant keepalive) and
 
 - **2GB VPS**: no torch, no heavy ML. PyMuPDF chosen over unstructured/docling/marker.
 - **Serbian language**: all UX in Serbian. Cyrillic↔Latin via cyrtranslit. Cohere embed-v4.0 for multilingual.
-- **No framework**: raw Anthropic SDK. Claude's native server tools (`web_search_20260209`, `code_execution_20250825`) require direct SDK usage.
+- **No framework**: raw Anthropic SDK. Claude's native server tools (`web_search_20260209` + auto-injected `code_execution`) require direct SDK usage.
 - `langchain-text-splitters` is the sole LangChain dep (MarkdownHeaderTextSplitter + RecursiveCharacterTextSplitter only).
 - **Never run `ingest.py --force`** or call `recreate_collection()` without explicit user approval. This deletes all indexed vectors — production data loss.
 
@@ -107,6 +118,7 @@ Two entry points: `bot.py` (Telegram bot + health server + Qdrant keepalive) and
 - `tests/test_vector_store.py`: `delete_by_filename` filter construction, no-match silent behavior, delete-then-upsert replacement flow, `list_documents` aggregation and pagination.
 - `tests/test_tools_used.py`: `tools_used` annotation — verifies tool metadata lands in chat history but never in Telegram reply, annotation format, no-tools edge case.
 - `tests/test_document_handler.py`: path traversal sanitization, safe filename in delete, page-count warning suffix, chunk-overflow hard block (asserts embed/upsert not called), Qdrant quota branch vs generic Qdrant error fallthrough. Thresholds referenced via `telegram_handler._MAX_CHUNKS` / `_PAGE_WARN_THRESHOLD` so tests track constant changes.
+- `tests/test_invites.py`: invite token store + registration store — create, consume, expiry, double-consume, persistence, load, list_pending, used-entry pruning, registration CRUD, duplicate blocking, TTL pruning, backward compat.
 - `test_local.py`: manual integration tests (PDF extraction, Cohere embeddings, agent). Requires API keys.
 
 ## Known Issues

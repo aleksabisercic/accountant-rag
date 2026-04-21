@@ -12,12 +12,15 @@ from telegram import (
     BotCommand,
     BotCommandScopeChat,
     BotCommandScopeDefault,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     InputProfilePhotoStatic,
     Update,
 )
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -29,7 +32,7 @@ from telegram.error import BadRequest, Forbidden
 import pymupdf
 from qdrant_client.http.exceptions import UnexpectedResponse
 
-from src import acl, vector_store
+from src import acl, invites, vector_store
 from src.agent import AgentResponse, Source, run as agent_run
 from src.analytics import get_recent_questions, get_stats, log_escalation, log_query
 from src.config import CONFIG, TELEGRAM_BOT_TOKEN
@@ -72,15 +75,22 @@ _ADMIN_COMMANDS = _USER_COMMANDS + [
     BotCommand("stats", "Statistika korišćenja"),
     BotCommand("pitanja", "Lista pitanja iz prethodnog perioda"),
     BotCommand("broadcast", "Pošalji obaveštenje svima"),
+    BotCommand("invite", "Kreiraj pozivni link za klijenta"),
 ]
 
 _chat_history: dict[int, list[dict]] = defaultdict(list)
 _rate_timestamps: dict[int, list[float]] = defaultdict(list)
 _last_activity: dict[int, float] = {}
 
+# Registration form state (in-memory, lost on restart — acceptable)
+_REG_ASK_NAME = "ask_name"
+_REG_ASK_COMPANY = "ask_company"
+_REG_STATE_TTL = 1800  # 30 min
+_registration_state: dict[int, dict] = {}
+
 
 def _sweep_inactive() -> None:
-    """Remove history and rate-limit entries for chats idle longer than TTL."""
+    """Remove history, rate-limit, and stale registration entries for idle chats."""
     now = time.monotonic()
     stale = [cid for cid, ts in _last_activity.items() if now - ts > _INACTIVE_TTL_S]
     for cid in stale:
@@ -89,6 +99,15 @@ def _sweep_inactive() -> None:
         _last_activity.pop(cid, None)
     if stale:
         logger.info("Swept %d inactive chat(s)", len(stale))
+    # Evict abandoned registration forms
+    stale_reg = [
+        cid for cid, s in _registration_state.items()
+        if now - s.get("started_at", 0) > _REG_STATE_TTL
+    ]
+    for cid in stale_reg:
+        _registration_state.pop(cid, None)
+    if stale_reg:
+        logger.info("Swept %d stale registration(s)", len(stale_reg))
 
 
 async def _sweep_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -138,10 +157,212 @@ async def _notify_admins_escalation(
             logger.exception("Failed to notify admin %s of escalation", admin_id)
 
 
+async def _notify_admins_invite_used(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    label: str,
+    created_by: int,
+) -> None:
+    """Fire-and-forget: notify all admins that an invite was consumed."""
+    safe_label = html.escape(label)
+    text = (
+        f"✅ Pozivnica iskorišćena\n"
+        f"Korisnik: {safe_label}\n"
+        f"Chat ID: {chat_id}\n"
+        f"Pozivnicu kreirao: {_display_id(created_by)}"
+    )
+    for admin_id in acl.get_admins():
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=text)
+        except Exception:
+            logger.exception("Failed to notify admin %s of invite use", admin_id)
+
+
 def _display_id(chat_id: int) -> str:
     """Format chat ID with name if known: 'Name (ID)' or just 'ID'."""
     name = acl.get_name(chat_id)
     return f"{name} ({chat_id})" if name else str(chat_id)
+
+
+async def _notify_admins_registration(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    name: str,
+    company: str,
+    username: str | None,
+) -> None:
+    """Send registration request to all admins with inline approve/deny buttons."""
+    safe_name = html.escape(name)
+    safe_company = html.escape(company)
+    user_tag = f"@{username}" if username else "—"
+    text = (
+        f"🔔 Nov zahtev za pristup\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Ime: {safe_name}\n"
+        f"Firma: {safe_company}\n"
+        f"Telegram: {user_tag}\n"
+        f"ID: {chat_id}"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Odobri", callback_data=f"reg_approve:{chat_id}"),
+            InlineKeyboardButton("❌ Odbij", callback_data=f"reg_deny:{chat_id}"),
+        ]
+    ])
+    for admin_id in acl.get_admins():
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id, text=text, reply_markup=keyboard,
+            )
+        except Exception:
+            logger.exception("Failed to notify admin %s of registration", admin_id)
+
+
+async def _handle_registration_step(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    """Handle a message from a user mid-registration. Returns True if handled."""
+    chat_id = update.effective_chat.id
+    state = _registration_state.get(chat_id)
+    if state is None:
+        return False
+
+    text = update.message.text.strip() if update.message.text else ""
+
+    if state["step"] == _REG_ASK_NAME:
+        if not text or len(text) > 100:
+            await update.message.reply_text("Unesite vaše ime i prezime (do 100 karaktera).")
+            return True
+        state["name"] = text
+        state["step"] = _REG_ASK_COMPANY
+        await update.message.reply_text("Naziv firme?")
+        return True
+
+    if state["step"] == _REG_ASK_COMPANY:
+        if not text or len(text) > 100:
+            await update.message.reply_text("Unesite naziv firme (do 100 karaktera).")
+            return True
+        name = state["name"]
+        company = text
+        _registration_state.pop(chat_id, None)
+        # Check for existing pending registration (rate limit)
+        if invites.get_registration(chat_id):
+            await update.message.reply_text(
+                "Već imate aktivan zahtev za pristup. Sačekajte odobrenje administratora."
+            )
+            return True
+        invites.add_registration(chat_id, name, company)
+        await update.message.reply_text(
+            "✅ Zahtev poslat.\n"
+            "Administrator će vas odobriti u najkraćem roku."
+        )
+        username = update.effective_user.username if update.effective_user else None
+        asyncio.create_task(
+            _notify_admins_registration(context, chat_id, name, company, username)
+        )
+        return True
+
+    return False
+
+
+async def _registration_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle inline approve/deny button taps from admins."""
+    query = update.callback_query
+    admin_id = query.from_user.id
+    if not _is_admin(admin_id):
+        await query.answer("Nemate pristup.", show_alert=True)
+        return
+
+    data = query.data or ""
+    if ":" not in data:
+        await query.answer("Nevažeći podatak.")
+        return
+
+    action, chat_id_str = data.split(":", 1)
+    try:
+        target_chat_id = int(chat_id_str)
+    except ValueError:
+        await query.answer("Nevažeći ID.")
+        return
+
+    reg = invites.resolve_registration(target_chat_id)
+    if reg is None:
+        await query.answer("Zahtev je već obrađen.", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except BadRequest:
+            pass
+        return
+
+    admin_name = acl.get_name(admin_id) or str(admin_id)
+    now_str = datetime.now(ZoneInfo("Europe/Belgrade")).strftime("%d.%m. %H:%M")
+    safe_name = html.escape(reg["name"])
+    safe_company = html.escape(reg["company"])
+
+    if action == "reg_approve":
+        label = f"{reg['company']} — {reg['name']}"
+        acl.add_user(target_chat_id, label)
+        # Notify the user
+        try:
+            await context.bot.send_message(
+                chat_id=target_chat_id,
+                text=(
+                    "✅ Pristup odobren!\n"
+                    "Dobrodošli. Možete početi sa postavljanjem pitanja.\n\n"
+                    "Možete me pitati, na primer:\n"
+                    '• \u201eDo kada se podnosi prijava za godišnji porez na dohodak za 2025?\u201c\n'
+                    '• \u201eKoja je razlika između preduzetnika i DOO u pogledu poreza?\u201c\n'
+                    '• \u201eKoji je trenutni iznos minimalne zarade u Srbiji?\u201c'
+                ),
+            )
+        except Exception:
+            logger.warning("Failed to notify user %s of approval", target_chat_id)
+        # Update admin message
+        try:
+            await query.edit_message_text(
+                f"🔔 Nov zahtev za pristup\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Ime: {safe_name}\n"
+                f"Firma: {safe_company}\n"
+                f"ID: {target_chat_id}\n\n"
+                f"✅ Odobrio: {html.escape(admin_name)} ({now_str})",
+                parse_mode=None,
+            )
+        except BadRequest:
+            pass
+        await query.answer("Korisnik odobren.")
+
+    elif action == "reg_deny":
+        # Notify the user
+        try:
+            await context.bot.send_message(
+                chat_id=target_chat_id,
+                text=(
+                    "❌ Vaš zahtev je odbijen.\n"
+                    "Kontaktirajte Mari-Mar za više informacija."
+                ),
+            )
+        except Exception:
+            logger.warning("Failed to notify user %s of denial", target_chat_id)
+        # Update admin message
+        try:
+            await query.edit_message_text(
+                f"🔔 Nov zahtev za pristup\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Ime: {safe_name}\n"
+                f"Firma: {safe_company}\n"
+                f"ID: {target_chat_id}\n\n"
+                f"❌ Odbio: {html.escape(admin_name)} ({now_str})",
+                parse_mode=None,
+            )
+        except BadRequest:
+            pass
+        await query.answer("Zahtev odbijen.")
+
+    else:
+        await query.answer("Nepoznata akcija.")
 
 
 def _trim_history(chat_id: int) -> None:
@@ -342,16 +563,69 @@ def _split_html(text: str, limit: int) -> list[str]:
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
+
+    # Deep-link invite token: /start <token>
+    if context.args:
+        token = context.args[0]
+        if _is_allowed(chat_id):
+            await update.message.reply_text(
+                "Zdravo! Već imate pristup. Postavite mi pitanje."
+            )
+            return
+        invite = invites.consume(token, chat_id)
+        if invite is None:
+            await update.message.reply_text(
+                "Ovaj pozivni link nije validan ili je istekao.\n"
+                "Kontaktirajte administratora za novi link."
+            )
+            return
+        label = invite["label"]
+        acl.add_user(chat_id, label)
+        safe_label = html.escape(label)
+        await update.message.reply_text(
+            f"Dobrodošli, <b>{safe_label}</b>! 🎉\n\n"
+            f"Vaš nalog je aktiviran. Možete odmah početi sa korišćenjem bota.\n\n"
+            f"Možete me pitati, na primer:\n"
+            f'• \u201eDo kada se podnosi prijava za godišnji porez na dohodak za 2025?\u201c\n'
+            f'• \u201eKoja je razlika između preduzetnika i DOO u pogledu poreza?\u201c\n'
+            f'• \u201eKoji je trenutni iznos minimalne zarade u Srbiji?\u201c',
+            parse_mode=ParseMode.HTML,
+        )
+        asyncio.create_task(
+            _notify_admins_invite_used(context, chat_id, label, invite["created_by"])
+        )
+        return
+
+    # Normal /start — no token
+    if _is_allowed(chat_id):
+        await update.message.reply_text(
+            "Zdravo! 👋\n\n"
+            "Ja sam računovodstveni asistent kompanije Mari-Mar. "
+            "Pomažem sa pitanjima iz oblasti poreza, računovodstva i poslovnih propisa.\n\n"
+            "Možete me pitati, na primer:\n"
+            '• \u201eDo kada se podnosi prijava za godišnji porez na dohodak za 2025?\u201c\n'
+            '• \u201eKoja je razlika između preduzetnika i DOO u pogledu poreza?\u201c\n'
+            '• \u201eKoji je trenutni iznos minimalne zarade u Srbiji?\u201c'
+        )
+        return
+
+    # Already has a pending registration?
+    if invites.get_registration(chat_id):
+        await update.message.reply_text(
+            "Već imate aktivan zahtev za pristup. Sačekajte odobrenje administratora."
+        )
+        return
+
+    # Stranger — start registration form. Cancel any stale form state.
+    _registration_state.pop(chat_id, None)
+    _registration_state[chat_id] = {
+        "step": _REG_ASK_NAME,
+        "started_at": time.monotonic(),
+    }
     await update.message.reply_text(
-        f"Zdravo! 👋\n\n"
-        f"Ja sam računovodstveni asistent kompanije Mari-Mar. "
-        f"Pomažem sa pitanjima iz oblasti poreza, računovodstva i poslovnih propisa.\n\n"
-        f"Možete me pitati, na primer:\n"
-        f'• \u201eDo kada se podnosi prijava za godišnji porez na dohodak za 2025?\u201c\n'
-        f'• \u201eKoja je razlika između preduzetnika i DOO u pogledu poreza?\u201c\n'
-        f'• \u201eKoji je trenutni iznos minimalne zarade u Srbiji?\u201c\n\n'
-        f"Vaš korisnički ID: {chat_id}\n"
-        f"Prosledite ovaj ID kompaniji Mari-Mar kako biste bili dodati na listu korisnika."
+        "Zdravo! 👋\n\n"
+        "Da biste dobili pristup, potrebna nam je registracija.\n\n"
+        "Kako se zovete? (ime i prezime)"
     )
 
 
@@ -487,6 +761,34 @@ async def removeadmin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"Admin {admin_id} nije na listi.")
 
 
+async def invite_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only: generate a one-time invite link for a client."""
+    chat_id = update.effective_chat.id
+    if not _is_admin(chat_id):
+        await update.message.reply_text("Nemate pristup ovoj komandi.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Upotreba: /invite Ime Prezime, Naziv firme\n"
+            "Primer: /invite Marko Marković, ACME d.o.o."
+        )
+        return
+
+    label = " ".join(context.args)
+    token = invites.create(label=label, created_by=chat_id)
+    bot_username = context.bot.username
+    link = f"https://t.me/{bot_username}?start={token}"
+    safe_label = html.escape(label)
+
+    await update.message.reply_text(
+        f"Pozivnica za <b>{safe_label}</b>:\n\n"
+        f"<code>{link}</code>\n\n"
+        f"Link važi 7 dana. Klijent samo klikne link i automatski dobija pristup.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
 
@@ -508,6 +810,7 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         lines.append("/stats [dana] — Statistika (podrazumevano 7 dana)")
         lines.append("/pitanja [dana] — Lista pitanja (podrazumevano 7 dana, max 90)")
         lines.append("/broadcast &lt;poruka&gt; — Pošalji obaveštenje svim korisnicima")
+        lines.append("/invite &lt;ime, firma&gt; — Kreiraj pozivni link za klijenta")
         lines.append("\n📄 Pošaljite PDF fajl da biste ga dodali u bazu znanja.")
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
@@ -616,7 +919,21 @@ async def clear_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    if not _is_allowed(chat_id):
+
+    # ACL check first — already-approved users always pass through,
+    # even if they have a stale pending registration.
+    if _is_allowed(chat_id):
+        pass  # fall through to normal message handling below
+    elif await _handle_registration_step(update, context):
+        # Registration form in progress — intercept
+        return
+    elif invites.get_registration(chat_id):
+        # Pending registration — user is waiting for approval
+        await update.message.reply_text(
+            "Vaš zahtev za pristup je na čekanju. Sačekajte odobrenje administratora."
+        )
+        return
+    else:
         await update.message.reply_text("Nemate pristup ovom botu.")
         return
 
@@ -661,10 +978,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         elapsed = time.monotonic() - t0
         logger.info(
             "chat=%s latency=%.1fs rounds=%d tokens_in=%d tokens_out=%d "
-            "web_search=%s sources=%d reply_len=%d",
+            "web_search=%s sources=%d reply_len=%d tools=%s",
             chat_id, elapsed, result.rounds,
             result.input_tokens, result.output_tokens,
             result.web_search_used, len(result.sources), len(result.text),
+            ",".join(result.tools_used) or "none",
         )
 
         reply = result.text
@@ -968,6 +1286,7 @@ async def _post_init(app: Application) -> None:
 def build_app() -> Application:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(_post_init).build()
     acl.load()
+    invites.load()
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("help", help_handler))
     app.add_handler(CommandHandler("clear", clear_handler))
@@ -980,6 +1299,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("dokumenti", dokumenti_handler))
     app.add_handler(CommandHandler("pitanja", pitanja_handler))
     app.add_handler(CommandHandler("broadcast", broadcast_handler))
+    app.add_handler(CommandHandler("invite", invite_handler))
+    app.add_handler(CallbackQueryHandler(_registration_callback, pattern=r"^reg_(approve|deny):"))
     app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 

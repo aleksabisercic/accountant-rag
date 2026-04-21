@@ -2,7 +2,9 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import anthropic
 
@@ -38,10 +40,6 @@ SEARCH_TOOL = {
     },
 }
 
-CODE_EXECUTION_TOOL = {
-    "type": "code_execution_20250825",
-    "name": "code_execution",
-}
 
 
 @dataclass
@@ -66,7 +64,10 @@ class AgentResponse:
 
 
 def _load_system_prompt() -> str:
-    return SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
+    prompt = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
+    now = datetime.now(ZoneInfo("Europe/Belgrade"))
+    date_line = f"\n\nDanašnji datum i vreme: {now.strftime('%d.%m.%Y. %H:%M')} (Europe/Belgrade)"
+    return prompt + date_line
 
 
 async def _handle_search(query: str) -> str:
@@ -91,26 +92,14 @@ async def _handle_search(query: str) -> str:
     )
 
 
-_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-
-_RETRYABLE = (
-    anthropic.RateLimitError,
-    anthropic.InternalServerError,
-    anthropic.APIConnectionError,
+_client = anthropic.AsyncAnthropic(
+    api_key=ANTHROPIC_API_KEY,
+    max_retries=5,
 )
-_MAX_RETRIES = 3
 
 
 async def _api_call_with_retry(**kwargs):
-    for attempt in range(1, _MAX_RETRIES + 1):
-        try:
-            return await _client.messages.create(**kwargs)
-        except _RETRYABLE as e:
-            if attempt == _MAX_RETRIES:
-                raise
-            wait = 2 ** attempt
-            logger.warning("API call failed (attempt %d/%d): %s. Retrying in %ds...", attempt, _MAX_RETRIES, e, wait)
-            await asyncio.sleep(wait)
+    return await _client.messages.create(**kwargs)
 
 
 async def run(messages: list[dict]) -> AgentResponse:
@@ -118,7 +107,6 @@ async def run(messages: list[dict]) -> AgentResponse:
     tools = [
         {"type": "web_search_20260209", "name": "web_search", "max_uses": 3},
         {"type": "custom", **SEARCH_TOOL},
-        CODE_EXECUTION_TOOL,
     ]
 
     sources: list[Source] = []
@@ -155,9 +143,23 @@ async def run(messages: list[dict]) -> AgentResponse:
                                     url=cite.url,
                                     cited_text=cite.cited_text,
                                 ))
+                elif block.type == "web_search_tool_result":
+                    web_search_used = True
+                    tools_used.add("web_search")
+                elif block.type == "server_tool_use":
+                    name = block.name
+                    if name in ("code_execution", "bash_code_execution", "text_editor_code_execution"):
+                        name = "code_execution"
+                    tools_used.add(name)
+                elif block.type in (
+                    "bash_code_execution_tool_result",
+                    "text_editor_code_execution_tool_result",
+                ):
+                    tools_used.add("code_execution")
             logger.info(
-                "agent rounds=%d input_tokens=%d output_tokens=%d web_search=%s",
+                "agent rounds=%d input_tokens=%d output_tokens=%d web_search=%s tools=%s",
                 round_num, total_input, total_output, web_search_used,
+                ",".join(sorted(tools_used)) or "none",
             )
             return AgentResponse(
                 text="\n".join(text_parts),
@@ -178,6 +180,17 @@ async def run(messages: list[dict]) -> AgentResponse:
                 web_search_used = True
                 tools_used.add("web_search")
             elif block.type == "server_tool_use":
+                # Sub-tools bash_code_execution / text_editor_code_execution
+                # normalize to "code_execution" for clean tracking
+                name = block.name
+                if name in ("code_execution", "bash_code_execution", "text_editor_code_execution"):
+                    name = "code_execution"
+                tools_used.add(name)
+                logger.debug("server_tool_use: %s (raw: %s)", name, block.name)
+            elif block.type in (
+                "bash_code_execution_tool_result",
+                "text_editor_code_execution_tool_result",
+            ):
                 tools_used.add("code_execution")
             elif block.type == "tool_use" and block.name == "search_documents":
                 tools_used.add("search_documents")
@@ -209,8 +222,9 @@ async def run(messages: list[dict]) -> AgentResponse:
 
     text_parts = [b.text for b in response.content if b.type == "text"]
     logger.info(
-        "agent rounds=%d (max) input_tokens=%d output_tokens=%d web_search=%s",
+        "agent rounds=%d (max) input_tokens=%d output_tokens=%d web_search=%s tools=%s",
         MAX_ROUNDS, total_input, total_output, web_search_used,
+        ",".join(sorted(tools_used)) or "none",
     )
     return AgentResponse(
         text="\n".join(text_parts) if text_parts else "Nisam uspeo da pronađem odgovor.",

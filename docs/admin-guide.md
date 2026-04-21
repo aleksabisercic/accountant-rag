@@ -1,27 +1,57 @@
 # Admin vodic
 
-## Dobijanje vaseg Chat ID-a
+## Dodavanje novog admina
 
-1. Otvorite bota u Telegramu t.me/MariMarRacunovodstvoBot
-2. Posaljite `/start`
-3. Bot ce vam prikazati vas **korisnciki ID** (broj)
-4. Postojeci admin vas dodaje komandom `/addadmin <vas ID>`
+1. Novi admin otvori bota: t.me/MariMarRacunovodstvoBot
+2. Posaljite `/start` — bot prikazuje korisnciki ID
+3. Postojeci admin ga dodaje: `/addadmin <ID> Ime`
 
 ---
 
-## Upravljanje korisnicima
+## Dodavanje korisnika (klijenata)
 
-Klijent salje `/start` botu i dobija svoj ID. Taj ID vam prosledi (Viber,
-poruka, uzivo — svejedno).
+### Pozivni link (preporucen nacin)
+
+1. Posaljite botu: `/invite Petar Petrovic, Firma d.o.o.`
+2. Bot vraca jednokratni link (vazi 7 dana)
+3. Posaljite link klijentu (WhatsApp, email, Viber — svejedno)
+4. Klijent klikne link → automatski dobija pristup
+5. Svi admini dobijaju obavestenje da je pozivnica iskoriscena
+
+### Registracija (klijent sam trazi pristup)
+
+Ako klijent otvori bota bez pozivnog linka:
+
+1. Klijent salje `/start`
+2. Bot pita za ime i prezime, zatim za naziv firme
+3. Svi admini dobijaju obavestenje sa dugmicima **✅ Odobri** / **❌ Odbij**
+4. Admin klikne ✅ → klijent automatski dobija pristup i obavestenje
+5. Admin klikne ❌ → klijent dobija obavestenje da je zahtev odbijen
+
+Zahtev istice posle 24h ako niko ne reaguje. Klijent moze probati ponovo.
+
+### Rucno dodavanje
 
 | Komanda                          | Opis                                 |
 | -------------------------------- | ------------------------------------ |
-| `/adduser 123456 Petar Petrovic` | Dodaj korisnika (ime je opciono)     |
+| `/adduser 123456 Petar Petrovic` | Dodaj korisnika rucno (ime opciono)  |
 | `/adduser 123456 Novo Ime`       | Azuriraj ime postojeceg korisnika    |
 | `/removeuser 123456`             | Ukloni korisnika                     |
+
+---
+
+## Sve admin komande
+
+| Komanda                          | Opis                                 |
+| -------------------------------- | ------------------------------------ |
+| `/invite Ime, Firma`             | Kreiraj pozivni link za klijenta     |
+| `/adduser <ID> [ime]`            | Dodaj korisnika rucno                |
+| `/removeuser <ID>`               | Ukloni korisnika                     |
 | `/users`                         | Prikazi sve korisnike (sa imenima)   |
-| `/addadmin 123456 Ime Admina`    | Dodaj admina (ime je opciono)        |
-| `/removeadmin 123456`            | Ukloni admina                        |
+| `/addadmin <ID> [ime]`           | Dodaj admina                         |
+| `/removeadmin <ID>`              | Ukloni admina                        |
+| `/stats [dana]`                  | Statistika (podrazumevano 7 dana)    |
+| `/pitanja [dana]`                | Lista pitanja (max 90 dana)          |
 | `/broadcast <poruka>`            | Pošalji obaveštenje svim korisnicima |
 
 Ako je lista korisnika prazna — svi imaju pristup (bez ogranicenja). Ne mozete
@@ -33,14 +63,16 @@ ukloniti sami sebe kao admina.
 biti kraca od 4096 karaktera (Telegram limit). Slanje ide u pozadini — odmah
 dobijate potvrdu, a na kraju izvestaj koliko je uspesno poslato.
 
-### Korisnicke komande (svi korisnici)
+---
 
-| Komanda      | Opis                                 |
-| ------------ | ------------------------------------ |
-| `/start`     | Prikazi dobrodoslicu i korisnciki ID |
-| `/clear`     | Obrisi istoriju razgovora            |
-| `/help`      | Prikazi listu komandi                |
-| `/dokumenti` | Prikazi dokumente u bazi znanja      |
+## Korisnicke komande (svi korisnici)
+
+| Komanda      | Opis                                    |
+| ------------ | --------------------------------------- |
+| `/start`     | Registracija ili pozdravna poruka       |
+| `/clear`     | Obrisi istoriju razgovora               |
+| `/help`      | Prikazi listu komandi                   |
+| `/dokumenti` | Prikazi dokumente u bazi znanja         |
 
 ---
 
