@@ -63,10 +63,10 @@ _USER_COMMANDS = [
     BotCommand("start", "Pozdravna poruka i vaš ID"),
     BotCommand("help", "Prikaži listu komandi"),
     BotCommand("clear", "Obriši istoriju razgovora"),
-    BotCommand("dokumenti", "Prikaži dokumente u bazi znanja"),
 ]
 
 _ADMIN_COMMANDS = _USER_COMMANDS + [
+    BotCommand("dokumenti", "Prikaži dokumente u bazi znanja"),
     BotCommand("adduser", "Dodaj korisnika"),
     BotCommand("removeuser", "Ukloni korisnika"),
     BotCommand("users", "Prikaži listu korisnika"),
@@ -797,11 +797,11 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/start — Pozdravna poruka i vaš korisnički ID",
         "/clear — Obriši istoriju razgovora",
         "/help — Prikaži listu komandi",
-        "/dokumenti — Prikaži dokumente u bazi znanja",
     ]
 
     if _is_admin(chat_id):
         lines.append("\n<b>Admin komande:</b>\n")
+        lines.append("/dokumenti — Prikaži dokumente u bazi znanja")
         lines.append("/adduser &lt;ID&gt; [ime] — Dodaj korisnika")
         lines.append("/removeuser &lt;ID&gt; — Ukloni korisnika")
         lines.append("/users — Prikaži listu korisnika")
@@ -820,8 +820,8 @@ async def dokumenti_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     chat_id = update.effective_chat.id
-    if not _is_allowed(chat_id):
-        await update.message.reply_text("Nemate pristup ovom botu.")
+    if not _is_admin(chat_id):
+        await update.message.reply_text("Nemate pristup ovoj komandi.")
         return
 
     docs = await vector_store.list_documents()
