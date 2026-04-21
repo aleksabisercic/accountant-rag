@@ -547,7 +547,7 @@ async def broadcast_handler(
         return
 
     if not context.args:
-        await update.message.reply_text("Upotreba: /broadcast &lt;poruka&gt;")
+        await update.message.reply_text("Upotreba: /broadcast <poruka>")
         return
 
     message = "📢 Obaveštenje:\n\n" + " ".join(context.args)
@@ -653,7 +653,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         messages = list(_chat_history[chat_id])
         result: AgentResponse = await agent_run(messages)
 
-        _chat_history[chat_id].append({"role": "assistant", "content": result.text})
+        history_text = result.text
+        if result.tools_used:
+            history_text += f"\n\n[Korišćeni alati: {', '.join(result.tools_used)}]"
+        _chat_history[chat_id].append({"role": "assistant", "content": history_text})
 
         elapsed = time.monotonic() - t0
         logger.info(
@@ -924,28 +927,6 @@ async def _weekly_questions_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         logger.exception("Error generating weekly questions digest")
 
-
-async def _weekly_digest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send weekly digest to all admins. Scheduled for Monday 09:00 Belgrade time."""
-    try:
-        stats = await get_stats(days=7)
-        if stats["question_count"] < 2:
-            logger.info("Weekly digest skipped: only %d questions", stats["question_count"])
-            return
-
-        now = datetime.now(ZoneInfo("Europe/Belgrade"))
-        week_end = now.date()
-        week_start = week_end - timedelta(days=7)
-        header = f"Nedeljni pregled \u2014 sedmica od {week_start.strftime('%d.%m.')} do {week_end.strftime('%d.%m.')}"
-        text = _format_stats(stats, header)
-
-        for admin_id in acl.get_admins():
-            try:
-                await context.bot.send_message(chat_id=admin_id, text=text)
-            except Exception:
-                logger.exception("Failed to send weekly digest to admin %s", admin_id)
-    except Exception:
-        logger.exception("Error generating weekly digest")
 
 
 async def _set_bot_commands(bot) -> None:

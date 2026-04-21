@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiosqlite
@@ -95,9 +95,9 @@ async def get_stats(days: int = 7) -> dict:
     """Return stats dict for the last N days."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
-        prev_cutoff = (datetime.utcnow() - timedelta(days=days * 2)).isoformat()
-        now = datetime.utcnow().isoformat()
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        prev_cutoff = (datetime.now(timezone.utc) - timedelta(days=days * 2)).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
 
         # Current period
         row = await db.execute_fetchall(
@@ -156,7 +156,7 @@ async def get_stats(days: int = 7) -> dict:
 async def get_recent_questions(days: int) -> list[dict]:
     """Return all user questions from the last N days, oldest first."""
     async with aiosqlite.connect(DB_PATH) as db:
-        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
         rows = await db.execute_fetchall(
             """SELECT chat_id, user_message, created_at
                FROM queries WHERE created_at >= ?

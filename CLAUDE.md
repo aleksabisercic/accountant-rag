@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Serbian-language accounting RAG Telegram bot. Claude Sonnet 4.6 agentic loop (native web search + Qdrant vector search over accounting PDFs). Cohere embed-v4.0 for embeddings. All user-facing text in Serbian.
+Serbian-language accounting RAG Telegram bot. Claude Sonnet 4.6 agentic loop (native web search + Anthropic sandboxed code execution + Qdrant vector search over accounting PDFs). Cohere embed-v4.0 for embeddings. All user-facing text in Serbian.
 
 ## Commands
 
@@ -25,8 +25,11 @@ Two entry points: `bot.py` (Telegram bot + health server + Qdrant keepalive) and
 
 ### Agent (`src/agent.py`)
 - Claude tool-use loop, max rounds controlled by `config.yaml` `agent.max_tool_rounds`.
-- Three tools: `search_documents` (custom: embed query via Cohere → Qdrant vector search), `calculator` (custom: `numexpr`-based, accepts array of expressions, safety-capped at 10 expressions / 200 chars each), and `web_search_20250305` (Claude native, max 3 uses).
-- `agent.run(messages: list[dict]) → AgentResponse(text, sources, web_search_used, input_tokens, output_tokens, rounds)`. Decoupled from frontend.
+- Three tools: `search_documents` (custom: embed query via Cohere → Qdrant vector search), `code_execution` (Anthropic server-side sandbox: `code_execution_20250825`, Python 3.11 with numpy/scipy/pandas/sympy, no network, no local resource cost), and `web_search` (`web_search_20260209`, Claude native, max 3 uses). Code execution is free when paired with web_search.
+- `agent.run(messages: list[dict]) → AgentResponse(text, sources, web_search_used, tools_used, input_tokens, output_tokens, rounds)`. Decoupled from frontend.
+- Server-side tools (code_execution, web_search) are handled by the API — their results arrive in `response.content` as `server_tool_use` / `*_tool_result` blocks, no `tool_result` message needed. Only `search_documents` requires client-side handling.
+- `pause_turn` stop reason: code execution may pause for long-running turns — the loop sends a continuation message to resume.
+- Chat history annotation: `tools_used` list is appended as `[Korišćeni alati: ...]` to the assistant message stored in `_chat_history` (for Claude context on follow-ups), but never sent to Telegram. The reply to Telegram always uses clean `result.text`.
 - Retry with exponential backoff on Anthropic rate limit / 500 / connection errors.
 
 ### Ingestion (`src/pdf_loader.py` → `src/embeddings.py` → `src/vector_store.py`)
@@ -91,7 +94,7 @@ Two entry points: `bot.py` (Telegram bot + health server + Qdrant keepalive) and
 
 - **2GB VPS**: no torch, no heavy ML. PyMuPDF chosen over unstructured/docling/marker.
 - **Serbian language**: all UX in Serbian. Cyrillic↔Latin via cyrtranslit. Cohere embed-v4.0 for multilingual.
-- **No framework**: raw Anthropic SDK. Claude's native `web_search_20250305` tool requires direct SDK usage.
+- **No framework**: raw Anthropic SDK. Claude's native server tools (`web_search_20260209`, `code_execution_20250825`) require direct SDK usage.
 - `langchain-text-splitters` is the sole LangChain dep (MarkdownHeaderTextSplitter + RecursiveCharacterTextSplitter only).
 - **Never run `ingest.py --force`** or call `recreate_collection()` without explicit user approval. This deletes all indexed vectors — production data loss.
 
@@ -102,13 +105,12 @@ Two entry points: `bot.py` (Telegram bot + health server + Qdrant keepalive) and
 - `tests/test_chunking.py`: chunk_markdown contract (breadcrumbs, embedding_text, parent_text, size limits, transliteration).
 - `tests/test_acl.py`: ACL persistence, seed-from-config, add/remove users and admins.
 - `tests/test_vector_store.py`: `delete_by_filename` filter construction, no-match silent behavior, delete-then-upsert replacement flow, `list_documents` aggregation and pagination.
-- `tests/test_calculator.py`: `_handle_calculator` — arithmetic, math functions, batch expressions, safety guards (length/count caps, invalid input), accounting scenarios (PDV, salary, compound interest).
+- `tests/test_tools_used.py`: `tools_used` annotation — verifies tool metadata lands in chat history but never in Telegram reply, annotation format, no-tools edge case.
 - `tests/test_document_handler.py`: path traversal sanitization, safe filename in delete, page-count warning suffix, chunk-overflow hard block (asserts embed/upsert not called), Qdrant quota branch vs generic Qdrant error fallthrough. Thresholds referenced via `telegram_handler._MAX_CHUNKS` / `_PAGE_WARN_THRESHOLD` so tests track constant changes.
 - `test_local.py`: manual integration tests (PDF extraction, Cohere embeddings, agent). Requires API keys.
 
 ## Known Issues
 
-- `datetime.utcnow()` in analytics.py is deprecated in Python 3.12+.
 - `min_score` threshold (0.35) was calibrated on a 12-chunk / 2-PDF corpus. Re-evaluate when corpus grows significantly — score distributions will shift.
 - Command definitions live in 3 places: `_USER_COMMANDS`/`_ADMIN_COMMANDS` (menu), `help_handler` (help text), `build_app()` (handler registration). Adding a command requires updating all three — no compile-time check. Accepted tradeoff at current command count.
 - Stale command scopes: if an admin is removed while bot is down, their Telegram menu retains admin commands until next bot restart (startup only sets scopes for current admins, doesn't clean up former ones).

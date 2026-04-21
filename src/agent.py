@@ -1,12 +1,10 @@
 import asyncio
 import json
 import logging
-import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import anthropic
-import numexpr
 
 from src.config import ANTHROPIC_API_KEY, CONFIG
 
@@ -40,29 +38,9 @@ SEARCH_TOOL = {
     },
 }
 
-CALCULATOR_TOOL = {
-    "name": "calculator",
-    "description": (
-        "Evaluate one or more mathematical expressions and return numeric results. "
-        "Use this tool for ANY arithmetic — never attempt mental math. "
-        "Input must be valid numeric expressions using Python syntax. "
-        "Supported: +, -, *, /, ** (exponent), % (modulo), parentheses, "
-        "and functions: sqrt, log (natural), log10, abs, sin, cos, tan, floor. "
-        "Constants: pi, e. "
-        "IMPORTANT: Use ** for powers, NOT ^. Use only numeric literals, no variable names. "
-        "Examples: ['(1500000 * 0.20) + 5000', '(1 + 0.05)**30 * 1000000', 'sqrt(144)']"
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "expressions": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Math expressions, e.g. ['1500000 * 0.20', 'sqrt(144)']",
-            }
-        },
-        "required": ["expressions"],
-    },
+CODE_EXECUTION_TOOL = {
+    "type": "code_execution_20250825",
+    "name": "code_execution",
 }
 
 
@@ -81,6 +59,7 @@ class AgentResponse:
     text: str
     sources: list[Source] = field(default_factory=list)
     web_search_used: bool = False
+    tools_used: list[str] = field(default_factory=list)
     input_tokens: int = 0
     output_tokens: int = 0
     rounds: int = 0
@@ -112,25 +91,6 @@ async def _handle_search(query: str) -> str:
     )
 
 
-_CALC_LOCAL = {"pi": math.pi, "e": math.e}
-_MAX_EXPRESSIONS = 10
-_MAX_EXPR_LEN = 200
-
-
-def _handle_calculator(expressions: list[str]) -> str:
-    results = []
-    for expr in expressions[:_MAX_EXPRESSIONS]:
-        if len(expr) > _MAX_EXPR_LEN:
-            results.append({"expression": expr[:50] + "...", "error": "Expression too long"})
-            continue
-        try:
-            result = float(numexpr.evaluate(expr, local_dict=_CALC_LOCAL))
-            results.append({"expression": expr, "result": result})
-        except Exception as e:
-            results.append({"expression": expr, "error": str(e)})
-    return json.dumps(results)
-
-
 _client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
 _RETRYABLE = (
@@ -156,13 +116,14 @@ async def _api_call_with_retry(**kwargs):
 async def run(messages: list[dict]) -> AgentResponse:
     system = _load_system_prompt()
     tools = [
-        {"type": "web_search_20250305", "name": "web_search", "max_uses": 3},
+        {"type": "web_search_20260209", "name": "web_search", "max_uses": 3},
         {"type": "custom", **SEARCH_TOOL},
-        {"type": "custom", **CALCULATOR_TOOL},
+        CODE_EXECUTION_TOOL,
     ]
 
     sources: list[Source] = []
     seen_sources: set[str] = set()
+    tools_used: set[str] = set()
     web_search_used = False
     total_input = 0
     total_output = 0
@@ -170,7 +131,7 @@ async def run(messages: list[dict]) -> AgentResponse:
     for round_num in range(1, MAX_ROUNDS + 1):
         response = await _api_call_with_retry(
             model=MODEL,
-            max_tokens=4096,
+            max_tokens=5120,
             system=system,
             tools=tools,
             messages=messages,
@@ -202,23 +163,24 @@ async def run(messages: list[dict]) -> AgentResponse:
                 text="\n".join(text_parts),
                 sources=sources,
                 web_search_used=web_search_used,
+                tools_used=sorted(tools_used),
                 input_tokens=total_input,
                 output_tokens=total_output,
                 rounds=round_num,
             )
 
+        # Collect client-side tool results (search_documents).
+        # Server-side tools (code_execution, web_search) are handled by the API
+        # — their results are already in response.content, no tool_result needed.
         tool_results = []
         for block in response.content:
             if block.type == "web_search_tool_result":
                 web_search_used = True
-            elif block.type == "tool_use" and block.name == "calculator":
-                result_text = _handle_calculator(block.input["expressions"])
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": result_text,
-                })
+                tools_used.add("web_search")
+            elif block.type == "server_tool_use":
+                tools_used.add("code_execution")
             elif block.type == "tool_use" and block.name == "search_documents":
+                tools_used.add("search_documents")
                 result_text = await _handle_search(block.input["query"])
                 result_data = json.loads(result_text)
                 for r in result_data.get("results", []):
@@ -238,7 +200,11 @@ async def run(messages: list[dict]) -> AgentResponse:
                 })
 
         messages.append({"role": "assistant", "content": response.content})
-        if tool_results:
+
+        if response.stop_reason == "pause_turn":
+            # Code execution may pause for long-running turns — continue
+            messages.append({"role": "user", "content": [{"type": "text", "text": "Continue."}]})
+        elif tool_results:
             messages.append({"role": "user", "content": tool_results})
 
     text_parts = [b.text for b in response.content if b.type == "text"]
@@ -250,6 +216,7 @@ async def run(messages: list[dict]) -> AgentResponse:
         text="\n".join(text_parts) if text_parts else "Nisam uspeo da pronađem odgovor.",
         sources=sources,
         web_search_used=web_search_used,
+        tools_used=sorted(tools_used),
         input_tokens=total_input,
         output_tokens=total_output,
         rounds=MAX_ROUNDS,

@@ -1,6 +1,6 @@
 """Tests for the weekly questions digest: data query + formatter."""
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import aiosqlite
@@ -32,7 +32,7 @@ async def _insert_query(db_path, chat_id: int, message: str, when: datetime) -> 
 async def test_get_recent_questions_filters_by_window(analytics_db):
     from src.analytics import get_recent_questions
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     await _insert_query(analytics_db, 1, "today", now - timedelta(hours=1))
     await _insert_query(analytics_db, 2, "three days ago", now - timedelta(days=3))
     await _insert_query(analytics_db, 3, "ten days ago", now - timedelta(days=10))
@@ -52,7 +52,7 @@ async def test_get_recent_questions_empty_window(analytics_db):
 async def test_get_recent_questions_preserves_chat_id(analytics_db):
     from src.analytics import get_recent_questions
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     await _insert_query(analytics_db, 42, "pitanje", now - timedelta(hours=2))
 
     rows = await get_recent_questions(days=1)
