@@ -14,9 +14,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Suppress noisy polling / health-check / HTTP-client logs
-logging.getLogger("httpx").setLevel(logging.WARNING)
+# Suppress noisy health-check access logs
 logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
+# Filter repetitive httpx polling lines, keep everything else
+logging.getLogger("httpx").addFilter(
+    type("_PollFilter", (), {
+        "filter": staticmethod(lambda r: "getUpdates" not in r.getMessage())
+    })()
+)
 
 HEALTH_PORT = CONFIG.get("health", {}).get("port", 8080)
 
