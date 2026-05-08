@@ -3,6 +3,8 @@ data/pdfs/
 data/analytics.db
 data/analytics.db-wal
 data/analytics.db-shm
+data/acl.json
+data/invites.json
 __pycache__/
 *.pyc
 .venv/
