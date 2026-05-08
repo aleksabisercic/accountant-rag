@@ -1248,6 +1248,26 @@ def _format_questions_digest(rows: list[dict], days: int) -> str:
     return "\n".join(lines)
 
 
+def _format_questions_digest_plain(rows: list[dict], days: int) -> str:
+    """Plain-text digest for chat-history injection (no HTML, no escaping).
+
+    Used so follow-up admin questions ("sumiraj top pitanja") can reason over
+    the data without re-fetching. Mirrors _format_questions_digest output.
+    """
+    header = f"Pitanja u poslednjih {days} dana ({len(rows)}):"
+    if not rows:
+        return header + "\n\nNema pitanja u ovom periodu."
+
+    lines = [header, ""]
+    for r in rows:
+        msg = r["user_message"] or ""
+        if len(msg) > _QUESTION_PREVIEW_MAX:
+            msg = msg[:_QUESTION_PREVIEW_MAX] + "…"
+        name = acl.get_name(r["chat_id"]) or f"ID {r['chat_id']}"
+        lines.append(f"• {msg} ({name})")
+    return "\n".join(lines)
+
+
 async def pitanja_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Admin-only /pitanja [dana] — list questions from the last N days."""
     chat_id = update.effective_chat.id
@@ -1279,6 +1299,15 @@ async def pitanja_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
         except Exception:
             await update.message.reply_text(chunk)
+
+    # Inject digest into chat history so follow-ups like "sumiraj top pitanja"
+    # can reason over the data without re-querying analytics.
+    arg_str = f" {context.args[0]}" if context.args else ""
+    plain = _format_questions_digest_plain(rows, days)
+    _chat_history[chat_id].append({"role": "user", "content": f"/pitanja{arg_str}"})
+    _chat_history[chat_id].append({"role": "assistant", "content": plain})
+    _trim_history(chat_id)
+    _last_activity[chat_id] = time.monotonic()
 
 
 async def _weekly_questions_job(context: ContextTypes.DEFAULT_TYPE) -> None:

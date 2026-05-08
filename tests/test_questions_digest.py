@@ -1,7 +1,7 @@
 """Tests for the weekly questions digest: data query + formatter."""
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
 import pytest
@@ -110,3 +110,144 @@ def test_format_digest_truncates_long_message():
     assert "…" in out
     # Full raw question should not appear — only the truncated prefix.
     assert long_q not in out
+
+
+def test_format_digest_plain_no_html_tags():
+    from src.telegram_handler import _format_questions_digest_plain
+
+    rows = [{"chat_id": 111, "user_message": "Do kada PPDG-1R?", "created_at": "t"}]
+    with patch("src.acl.get_name", return_value="Marko Petrović"):
+        out = _format_questions_digest_plain(rows, days=7)
+    assert "Pitanja u poslednjih 7 dana (1):" in out
+    assert "Do kada PPDG-1R?" in out
+    assert "Marko Petrović" in out
+    # No HTML tags or escaping — this is for chat history, not Telegram.
+    assert "<b>" not in out and "<i>" not in out
+    assert "&lt;" not in out and "&gt;" not in out
+
+
+def test_format_digest_plain_empty():
+    from src.telegram_handler import _format_questions_digest_plain
+
+    out = _format_questions_digest_plain([], days=7)
+    assert "Pitanja u poslednjih 7 dana (0)" in out
+    assert "Nema pitanja" in out
+
+
+def test_format_digest_plain_preserves_special_chars():
+    """Plain digest is for LLM context — raw chars must pass through verbatim."""
+    from src.telegram_handler import _format_questions_digest_plain
+
+    rows = [{"chat_id": 1, "user_message": "Šta je <PDV> & kako?", "created_at": "t"}]
+    with patch("src.acl.get_name", return_value="Marko"):
+        out = _format_questions_digest_plain(rows, days=1)
+    assert "Šta je <PDV> & kako?" in out
+
+
+def test_format_digest_plain_unknown_user():
+    from src.telegram_handler import _format_questions_digest_plain
+
+    rows = [{"chat_id": 999, "user_message": "anon", "created_at": "t"}]
+    with patch("src.acl.get_name", return_value=None):
+        out = _format_questions_digest_plain(rows, days=7)
+    assert "ID 999" in out
+
+
+async def test_pitanja_handler_injects_into_chat_history():
+    """After /pitanja, the digest must land in chat history so follow-ups can reason over it."""
+    from src import telegram_handler
+
+    chat_id = 42
+    rows = [
+        {"chat_id": 100, "user_message": "Koja je stopa PDV?", "created_at": "2026-05-01T10:00:00"},
+        {"chat_id": 200, "user_message": "Rok za PPDG-1R?", "created_at": "2026-05-02T11:00:00"},
+    ]
+
+    update = MagicMock()
+    update.effective_chat.id = chat_id
+    update.message = AsyncMock()
+
+    context = MagicMock()
+    context.args = ["7"]
+
+    telegram_handler._chat_history.pop(chat_id, None)
+
+    with (
+        patch("src.telegram_handler._is_admin", return_value=True),
+        patch(
+            "src.telegram_handler.get_recent_questions",
+            new_callable=AsyncMock,
+            return_value=rows,
+        ),
+        patch("src.acl.get_name", return_value="Korisnik"),
+    ):
+        await telegram_handler.pitanja_handler(update, context)
+
+    history = telegram_handler._chat_history[chat_id]
+    assert len(history) == 2
+    assert history[0] == {"role": "user", "content": "/pitanja 7"}
+    assert history[1]["role"] == "assistant"
+    assert "Pitanja u poslednjih 7 dana (2):" in history[1]["content"]
+    assert "Koja je stopa PDV?" in history[1]["content"]
+    assert "Rok za PPDG-1R?" in history[1]["content"]
+    # Plain text only — no HTML in chat history.
+    assert "<b>" not in history[1]["content"]
+
+    telegram_handler._chat_history.pop(chat_id, None)
+
+
+async def test_pitanja_handler_no_injection_on_fetch_error():
+    """If get_recent_questions fails, chat history must remain untouched."""
+    from src import telegram_handler
+
+    chat_id = 43
+    update = MagicMock()
+    update.effective_chat.id = chat_id
+    update.message = AsyncMock()
+
+    context = MagicMock()
+    context.args = []
+
+    telegram_handler._chat_history.pop(chat_id, None)
+
+    with (
+        patch("src.telegram_handler._is_admin", return_value=True),
+        patch(
+            "src.telegram_handler.get_recent_questions",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("db down"),
+        ),
+    ):
+        await telegram_handler.pitanja_handler(update, context)
+
+    assert chat_id not in telegram_handler._chat_history or not telegram_handler._chat_history[chat_id]
+
+
+async def test_pitanja_handler_uses_default_days_in_synthetic_command():
+    """When admin runs /pitanja without args, the synthetic user message should be '/pitanja' (no number)."""
+    from src import telegram_handler
+
+    chat_id = 44
+    update = MagicMock()
+    update.effective_chat.id = chat_id
+    update.message = AsyncMock()
+
+    context = MagicMock()
+    context.args = []
+
+    telegram_handler._chat_history.pop(chat_id, None)
+
+    with (
+        patch("src.telegram_handler._is_admin", return_value=True),
+        patch(
+            "src.telegram_handler.get_recent_questions",
+            new_callable=AsyncMock,
+            return_value=[],
+        ),
+    ):
+        await telegram_handler.pitanja_handler(update, context)
+
+    history = telegram_handler._chat_history[chat_id]
+    assert history[0] == {"role": "user", "content": "/pitanja"}
+
+    telegram_handler._chat_history.pop(chat_id, None)
