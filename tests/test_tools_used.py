@@ -46,8 +46,10 @@ def _build_update(chat_id, text="Koliki je PDV?"):
 
 
 async def test_tools_annotation_in_history_not_in_reply(chat_id):
+    # [CONF:NA] = out-of-scope marker, no disclaimer appended — keeps this
+    # test focused on tools_used behavior, not disclaimer rendering.
     result = _make_agent_response(
-        text="PDV iznosi 300.000 RSD.",
+        text="PDV iznosi 300.000 RSD. [CONF:NA]",
         tools_used=["code_execution", "search_documents"],
     )
     update = _build_update(chat_id)

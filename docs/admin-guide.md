@@ -94,3 +94,17 @@ znanja.
 `/stats 30` — poslednjih 30 dana
 
 Prikazuje: broj pitanja, jedinstvene korisnike, prosecno vreme odgovora.
+
+---
+
+## Eskalacije (automatska obavestenja)
+
+Kada bot proceni da nije siguran u odgovor ili nema dovoljno informacija, automatski salje obavestenje svim adminima sa originalnim pitanjem korisnika i odgovorom bota.
+
+Kada se eskalacija okida:
+- **Niska pouzdanost** — bot je dao opsti odgovor bez konkretnog izvora.
+- **Nema odgovora** — bot nije uspeo da nadje pouzdane informacije.
+
+Sta admin treba da uradi: po potrebi kontaktirajte klijenta direktno i dajte tacan odgovor. Eskalacije se belezi u statistici (`/stats` → broj eskalacija).
+
+Klijent automatski u svom odgovoru dobija napomenu i kontakt podatke Mari-Mar doo (telefoni, kalendar) — disclaimere ne pise sam bot, vec se dodaju automatski na osnovu nivoa pouzdanosti odgovora (visok / srednji / nizak / nema odgovora).

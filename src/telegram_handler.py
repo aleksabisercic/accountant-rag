@@ -56,8 +56,60 @@ _PAGE_WARN_THRESHOLD = 35
 _MAX_CHUNKS = 600
 _INACTIVE_TTL_S = CONFIG["telegram"].get("inactive_ttl_minutes", 60) * 60  # seconds
 
-# Escalation detection — must match the exact phrase from prompts/system.txt
-_ESCALATION_MARKER = "preporučujemo da kontaktirate mari-mar.rs za direktnu konsultaciju"
+# Confidence sentinel emitted by the LLM at end of every response.
+# Stripped before sending to user; system appends the matching disclaimer below.
+# [CONF:LOW] and [CONF:NONE] both drive escalation notifications to admins.
+_CONF_PATTERN = re.compile(r"\[CONF:(HIGH|MED|LOW|NONE|NA)\]\s*$", re.IGNORECASE)
+_ESCALATE_LEVELS = frozenset({"LOW", "NONE"})
+
+_CONTACT_BLOCK = (
+    "\n\nZakažite konsultacije:\n"
+    "Kalendar i kontakt:\n"
+    "0112392909\n"
+    "0112360575"
+)
+
+_DISCLAIMERS = {
+    "HIGH": (
+        "\n\nNapomena: Ovaj odgovor je informativnog karaktera. "
+        "Za potvrdu i primenu na vašu konkretnu situaciju, možete kontaktirati Mari-Mar doo."
+    ) + _CONTACT_BLOCK,
+    "MED": (
+        "\n\nNapomena: Ovaj odgovor je informativnog karaktera i može zavisiti od specifičnosti "
+        "vaše situacije. Za tačan i potpun savet, preporučujemo da kontaktirate stručni tim Mari-Mar doo."
+    ) + _CONTACT_BLOCK,
+    "LOW": (
+        "\n\nNapomena: Informacije u ovom odgovoru služe isključivo u opšte informativne svrhe "
+        "i ne predstavljaju zvaničan poreski ili knjigovodstveni savet. Za donošenje odluka, "
+        "neophodna je konsultacija sa stručnim timom Mari-Mar doo."
+    ) + _CONTACT_BLOCK,
+    "NONE": (
+        "\n\nTrenutno nemam dovoljno pouzdanih informacija da bih dao tačan odgovor na vaše pitanje. "
+        "Predlažem da se obratite direktno stručnom timu Mari-Mar doo, kako biste dobili precizan i pouzdan savet."
+    ) + _CONTACT_BLOCK,
+    "NA": "",  # out-of-scope: no disclaimer, no contact block
+}
+
+
+def _apply_disclaimer(text: str) -> tuple[str, str]:
+    """Strip trailing [CONF:*] sentinel and return (clean_text_with_disclaimer, level).
+
+    Falls back to LOW if the LLM omits the sentinel — safer than HIGH for legal posture.
+    """
+    match = _CONF_PATTERN.search(text)
+    if match:
+        level = match.group(1).upper()
+        clean = text[: match.start()].rstrip()
+    else:
+        level = "LOW"
+        clean = text.rstrip()
+        logger.warning("Response missing [CONF:*] sentinel — defaulting to LOW")
+    return clean + _DISCLAIMERS[level], level
+
+
+def _strip_sentinel(text: str) -> str:
+    """Remove [CONF:*] from text without adding a disclaimer (for chat history storage)."""
+    return _CONF_PATTERN.sub("", text).rstrip()
 
 _USER_COMMANDS = [
     BotCommand("start", "Pozdravna poruka i vaš ID"),
@@ -970,7 +1022,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         messages = list(_chat_history[chat_id])
         result: AgentResponse = await agent_run(messages)
 
-        history_text = result.text
+        reply, conf_level = _apply_disclaimer(result.text)
+        clean_text = _strip_sentinel(result.text)
+
+        history_text = clean_text
         if result.tools_used:
             history_text += f"\n\n[Korišćeni alati: {', '.join(result.tools_used)}]"
         _chat_history[chat_id].append({"role": "assistant", "content": history_text})
@@ -978,14 +1033,14 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         elapsed = time.monotonic() - t0
         logger.info(
             "chat=%s latency=%.1fs rounds=%d tokens_in=%d tokens_out=%d "
-            "web_search=%s sources=%d reply_len=%d tools=%s",
+            "web_search=%s sources=%d reply_len=%d conf=%s tools=%s",
             chat_id, elapsed, result.rounds,
             result.input_tokens, result.output_tokens,
-            result.web_search_used, len(result.sources), len(result.text),
+            result.web_search_used, len(result.sources), len(clean_text),
+            conf_level,
             ",".join(result.tools_used) or "none",
         )
 
-        reply = result.text
         sources_html = _format_sources(result.sources) if result.sources else ""
 
         await _send_long(update, reply, sources_html)
@@ -995,7 +1050,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             log_query(
                 chat_id=chat_id,
                 user_message=user_text,
-                bot_response=result.text,
+                bot_response=clean_text,
                 used_web_search=result.web_search_used,
                 response_time_ms=response_time_ms,
                 input_tokens=result.input_tokens,
@@ -1003,10 +1058,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
         )
 
-        if _ESCALATION_MARKER in result.text.lower():
-            asyncio.create_task(log_escalation(chat_id, user_text, result.text[:50]))
+        if conf_level in _ESCALATE_LEVELS:
+            reason = f"CONF:{conf_level} | {clean_text[:50]}"
+            asyncio.create_task(log_escalation(chat_id, user_text, reason))
             asyncio.create_task(
-                _notify_admins_escalation(context, chat_id, user_text, result.text)
+                _notify_admins_escalation(context, chat_id, user_text, clean_text)
             )
     except Exception:
         logger.exception("Error processing message from %s", chat_id)

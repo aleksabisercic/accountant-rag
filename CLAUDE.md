@@ -73,7 +73,8 @@ Two entry points: `bot.py` (Telegram bot + health server + Qdrant keepalive) and
 - `/clear` — reset chat history. `/adduser`, `/removeuser`, `/users`, `/addadmin`, `/removeadmin` — admin-only. Self-removal as admin blocked.
 - `/dokumenti` — lists indexed PDFs from Qdrant. All users see filenames; admins also see chunk counts. Uses `_split_html` for long lists.
 - `/broadcast <msg>` — admin-only. Rejects messages >4096 chars. Runs via `asyncio.create_task` (non-blocking). Sends to all users+admins (deduplicated), HTML with plain text fallback, `Forbidden` tracked separately. Admin gets interim "⏳" then final summary.
-- Escalation detection: after `agent_run()`, checks if response contains `_ESCALATION_MARKER` (lowercased match against the exact system prompt phrase). On match: fire-and-forget `log_escalation()` + `_notify_admins_escalation()` (sends user question + bot response preview to all admins).
+- Confidence sentinel + disclaimer: every LLM response ends with `[CONF:HIGH|MED|LOW|NONE|NA]` (regex `_CONF_PATTERN`). `_apply_disclaimer()` strips the marker and appends a fixed Mari-Mar disclaimer + `_CONTACT_BLOCK` (phone numbers); `NA` = out-of-scope, no disclaimer. Default fallback when sentinel missing = LOW (cautious posture, logs a warning). `_strip_sentinel()` is used for chat history + analytics so the LLM doesn't anchor on past confidence labels in follow-ups. Disclaimer texts and contact block are module constants in `telegram_handler.py` — tune wording/phone numbers there, not in the prompt.
+- Escalation: fires when `conf_level in _ESCALATE_LEVELS` (currently `{LOW, NONE}`). Fire-and-forget `log_escalation()` (reason prefixed `CONF:<level> | <preview>`) + `_notify_admins_escalation()` sending user question + bot response preview to all admins. To narrow the trigger (e.g., NONE only) edit the frozenset; to widen (e.g., MED too) extend it.
 - Admin PDF upload: download → read page count (PyMuPDF) → extract → chunk → hard-block if `len(chunks) > _MAX_CHUNKS` (600, rejects before embedding spend) → embed → delete old vectors by filename → upsert. Distinct error branches: scanned PDF, empty extraction, chunk overflow, Qdrant quota (`UnexpectedResponse` with status 403/507 or body containing "quota"/"storage") → "Qdrant skladište je puno" message, generic fallback. Success message appends a soft page-count warning when `page_count > _PAGE_WARN_THRESHOLD` (50). Thresholds are module constants near `_MAX_PDF_SIZE_MB` — tune there.
 - `/stats [days]` — admin analytics.
 - `/pitanja [days]` — admin-only. Lists every user question from the last N days (default 7, max 90) as `• <pitanje> (<ime or ID ...>)`. Uses `_split_html` for long lists. Questions truncated at `_QUESTION_PREVIEW_MAX` (200 chars). Also sent automatically every Monday 09:00 Europe/Belgrade by `_weekly_questions_job` (registered via `JobQueue.run_daily`, `days=(0,)`).
@@ -83,7 +84,7 @@ Two entry points: `bot.py` (Telegram bot + health server + Qdrant keepalive) and
 - SQLite with WAL mode at `data/analytics.db`. Fire-and-forget query logging.
 - `get_stats(days)` returns: question_count, unique_users, escalation_count, recent_escalations (last 5, newest first with timestamps), avg_response_time, week-over-week change.
 - `get_recent_questions(days)` returns list of `{chat_id, user_message, created_at}` for the last N days, ordered ASC. Powers `/pitanja` and the weekly questions job.
-- `log_escalation()` is wired up — triggered when Claude's response contains the escalation marker phrase. Logs to `escalations` table (reason truncated to 50 chars) and notifies all admins via Telegram with user question + bot response preview (500 chars).
+- `log_escalation()` fires from telegram_handler when the LLM emits `[CONF:LOW]` or `[CONF:NONE]`. Logs to `escalations` table with reason `CONF:<level> | <preview>` (truncated to 50 chars). Notifies all admins via Telegram with user question + bot response preview (500 chars). `get_stats().escalation_count` aggregates LOW + NONE together — split by parsing the `CONF:` prefix in `reason` if a breakdown becomes useful.
 - `update_daily_stats()` exists but is not wired up — dead code. `get_stats()` queries live, making it unnecessary at current volume.
 
 ### Qdrant Keep-alive (`src/qdrant_keepalive.py`)
@@ -99,7 +100,7 @@ Two entry points: `bot.py` (Telegram bot + health server + Qdrant keepalive) and
 
 - `.env` — API keys: ANTHROPIC_API_KEY, COHERE_API_KEY, QDRANT_URL, QDRANT_API_KEY, TELEGRAM_BOT_TOKEN
 - `config.yaml` — model, max_tool_rounds, top_k, min_score (0.35), chunk_size (2000), embedding_dimensions, collection_name, rate limits, inactive_ttl_minutes (60). Chat ID lists are seed values only; live ACL is `data/acl.json`.
-- `prompts/system.txt` — Serbian system prompt (editable without deploy). Two-tier referral: "Preporučujemo da kontaktirate mari-mar.rs za direktnu konsultaciju." (escalation — can't answer) vs "obratite se vašem računovođi" (has answer, suggests professional for precision). Only the first phrase triggers escalation detection.
+- `prompts/system.txt` — Serbian system prompt (editable without deploy). LLM must end every response with one of `[CONF:HIGH|MED|LOW|NONE|NA]`; the prompt forbids writing disclaimers, napomene, or Mari-Mar contact info — those are appended in code by `_apply_disclaimer()`. Editing disclaimer wording or phone numbers = edit `_DISCLAIMERS` / `_CONTACT_BLOCK` in `telegram_handler.py`, not the prompt.
 
 ## Key Constraints
 
