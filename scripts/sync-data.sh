@@ -53,13 +53,13 @@ if [ ${#SQLITE_FILES[@]} -gt 0 ]; then
   echo "==> Snapshotting SQLite files"
   for f in "${SQLITE_FILES[@]}"; do
     .venv/bin/python -c "
-import sqlite3, sys
+import sqlite3
 src = sqlite3.connect('data/$f')
 dst = sqlite3.connect('data/$f.export')
 with dst:
     src.backup(dst)
 src.close(); dst.close()
-print('  snapshot: data/$f.export ('+str(dst.execute and 'ok' or '')+')')
+print('  snapshot: data/$f.export')
 "
     scp "data/$f.export" "$SERVER:$REPO_PATH/data/$f.new"
     rm "data/$f.export"
@@ -70,9 +70,11 @@ print('  snapshot: data/$f.export ('+str(dst.execute and 'ok' or '')+')')
   for f in "${SQLITE_FILES[@]}"; do
     SWAP_CMDS+="mv data/$f.new data/$f && rm -f data/$f-wal data/$f-shm && "
   done
+  # If any swap step fails, always bring the bot back up (on the old DB) before
+  # surfacing the error — never leave prod stopped after a half-done migration.
   ssh "$SERVER" "cd $REPO_PATH && \
     docker compose stop bot && \
-    ${SWAP_CMDS}true && \
+    { ${SWAP_CMDS}true; } || { echo 'SWAP FAILED — restarting bot on previous data'; docker compose start bot; exit 1; } && \
     docker compose start bot && \
     sleep 4 && \
     docker compose ps --format 'table {{.Name}}\t{{.Status}}'"

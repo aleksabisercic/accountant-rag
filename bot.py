@@ -3,6 +3,7 @@ import logging
 import signal
 import time
 from aiohttp import web
+from aiohttp.http_exceptions import HttpProcessingError
 
 from src.analytics import init_db
 from src.qdrant_keepalive import keep_alive_loop
@@ -20,11 +21,15 @@ logger = logging.getLogger(__name__)
 # Suppress noisy health-check access logs
 logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 # Drop scanner traceback spam (Mirai-style bots hitting :8080 with malformed
-# CGI exploits → BadHttpMessage from aiohttp's parser). Real aiohttp errors
-# still pass through.
+# CGI exploits / raw bytes → HttpProcessingError family from aiohttp's parser,
+# logged as ERROR tracebacks). The bad-request exception is in record.exc_info,
+# never in the message string, so we match on the exception type. Real aiohttp
+# errors (anything not a parse failure) still pass through.
 logging.getLogger("aiohttp.server").addFilter(
     type("_ScannerNoiseFilter", (), {
-        "filter": staticmethod(lambda r: "BadHttpMessage" not in r.getMessage())
+        "filter": staticmethod(
+            lambda r: not (r.exc_info and isinstance(r.exc_info[1], HttpProcessingError))
+        )
     })()
 )
 # Filter repetitive httpx polling lines, keep everything else

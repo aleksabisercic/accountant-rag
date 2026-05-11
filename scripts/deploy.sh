@@ -48,7 +48,10 @@ ssh "$SERVER" "cd $REPO_PATH && \
   docker compose logs --tail=30 bot 2>&1 | grep -E 'ERROR|Application started|Traceback' | tail -10 || true"
 
 echo "==> Health endpoint"
-curl -sS -m 5 "http://${SERVER##*@}:8080/health" -w '\n  HTTP %{http_code} (%{time_total}s)\n' || \
-  echo "  WARNING: health endpoint not responding"
+# -m 12: a cold-container deep probe is sequential Qdrant(≤3s)+Cohere(≤3s) ⇒ up to ~6s,
+# plus TLS/wake on a hibernated Qdrant free tier — 5s would false-alarm on a healthy deploy.
+# -f: make curl fail (non-zero) on HTTP 503 so a degraded-dependency deploy surfaces here.
+curl -fsS -m 12 "http://${SERVER##*@}:8080/health" -w '\n  HTTP %{http_code} (%{time_total}s)\n' || \
+  echo "  WARNING: /health unreachable or degraded (HTTP 503) — check 'docker compose logs bot'"
 
 echo "==> ✓ Deploy complete."
