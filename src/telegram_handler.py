@@ -1100,6 +1100,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     try:
         file = await context.bot.get_file(doc.file_id)
         safe_name = Path(doc.file_name).name
+        PDF_DIR.mkdir(parents=True, exist_ok=True)
         pdf_path = PDF_DIR / safe_name
         await file.download_to_drive(str(pdf_path))
 
