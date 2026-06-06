@@ -41,7 +41,7 @@ logging.getLogger("httpx").addFilter(
 
 HEALTH_PORT = CONFIG.get("health", {}).get("port", 8080)
 _HEALTH_TTL_SECONDS = 60
-_HEALTH_PROBE_TIMEOUT = 3
+_HEALTH_PROBE_TIMEOUT = 5
 _health_cache: dict = {"ts": 0.0, "body": None, "status_code": 200}
 
 
