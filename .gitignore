@@ -9,3 +9,6 @@ __pycache__/
 *.pyc
 .venv/
 data/review/
+
+# Local-only (kept on disk, not published)
+CLAUDE.md
