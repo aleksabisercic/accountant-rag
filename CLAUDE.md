@@ -15,8 +15,12 @@ python ingest.py /path/to/pdfs      # Ingest from custom dir (combine with --for
 python review_pdf_output.py         # Review PDF parsing + chunking quality → data/review/
 python test_local.py                # Local tests (no Qdrant needed)
 .venv/bin/pytest tests/ -v          # Unit tests (pytest)
-docker-compose build && docker-compose down && docker-compose up -d  # Deploy (v1: down+up avoids ContainerConfig bug)
+docker-compose build && docker-compose down && docker-compose up -d  # Local dev (v1: down+up avoids ContainerConfig bug)
 docker-compose logs --tail=30       # Check logs
+
+./scripts/deploy.sh                 # Deploy to Hetzner prod: HEAD==origin/main check → ssh git pull → docker compose up -d --build → health verify
+./scripts/sync-data.sh acl.json invites.json analytics.db  # Migrate runtime state to prod (.db files: sqlite3.backup + atomic swap, ~5s downtime)
+ssh deploy@178.105.109.233          # Prod server (non-root deploy user; root@ for system admin only)
 ```
 
 ## Architecture
@@ -52,12 +56,15 @@ Two entry points: `bot.py` (Telegram bot + health server + Qdrant keepalive) and
 - Both `ensure_collection()` and `recreate_collection()` create the `filename` KEYWORD payload index.
 
 ### ACL (`src/acl.py`)
-- JSON-backed access control at `data/acl.json`. Seeds from `config.yaml` on first run, then independent.
+- JSON-backed access control at `data/acl.json`. Seeds from `config.yaml` `admin_chat_ids`/`allowed_chat_ids` when the file doesn't exist, then independent.
+- **`data/acl.json` is gitignored** (runtime state — mutated by `/adduser` etc.). `data/acl.example.json` is the tracked empty template. Tracking it caused merge conflicts on every deploy when ACL diverged — don't re-track it.
 - Mutations persist immediately — no restart needed to add/remove users or admins.
 - Admins are implicitly allowed — no need to also add them to `allowed_chat_ids`.
+- **Fail-OPEN by design**: `is_allowed()` returns True for everyone when `allowed_chat_ids` is empty (`config.yaml` ships it empty). So if `data/acl.json` is ever lost (fresh clone before `sync-data.sh`, accidental `rm`/`git clean`, restore from a pre-users backup) the bot answers anyone — admin functions stay gated (admin list seeds from `config.yaml`), but the corpus is generic accounting PDFs (no client-confidential data) and the only real cost is burned API quota. Accepted tradeoff (not fixed to fail-closed). Mitigation: on a fresh deploy run `sync-data.sh acl.json` *before* first start; if acl.json vanishes on a live box, restore from `/var/backups/mari-mar-bot/` immediately. Documented in `docs/RUNBOOK.md`.
 
 ### Invites & Registrations (`src/invites.py`)
 - JSON-backed store at `data/invites.json`. Same atomic tmp→rename persistence as `acl.py`. Three sections: `pending` (invite tokens), `used` (consumed tokens — audit trail, pruned after 30 days), `registrations` (pending approval requests, pruned after 24h).
+- **`data/invites.json` is gitignored** (runtime state); `data/invites.example.json` is the tracked empty template. `invites.py` `load()` initializes an empty store when the file is missing.
 - **Invite tokens (Flow B):** `create(label, created_by, ttl_days=7) → token` — `secrets.token_urlsafe(16)` (128-bit). `consume(token, chat_id) → dict | None` — atomic pop+expiry check under single-threaded asyncio.
 - **Registrations (Flow A):** `add_registration(chat_id, name, company) → bool` (False if already pending — rate limit). `get_registration(chat_id)`, `resolve_registration(chat_id, approved_by)`, `remove_registration(chat_id)`. One pending per chat_id.
 
@@ -77,7 +84,7 @@ Two entry points: `bot.py` (Telegram bot + health server + Qdrant keepalive) and
 - Escalation: fires when `conf_level in _ESCALATE_LEVELS` (currently `{LOW, NONE}`). Fire-and-forget `log_escalation()` (reason prefixed `CONF:<level> | <preview>`) + `_notify_admins_escalation()` sending user question + bot response preview to all admins. To narrow the trigger (e.g., NONE only) edit the frozenset; to widen (e.g., MED too) extend it.
 - Admin PDF upload: download → read page count (PyMuPDF) → extract → chunk → hard-block if `len(chunks) > _MAX_CHUNKS` (600, rejects before embedding spend) → embed → delete old vectors by filename → upsert. Distinct error branches: scanned PDF, empty extraction, chunk overflow, Qdrant quota (`UnexpectedResponse` with status 403/507 or body containing "quota"/"storage") → "Qdrant skladište je puno" message, generic fallback. Success message appends a soft page-count warning when `page_count > _PAGE_WARN_THRESHOLD` (50). Thresholds are module constants near `_MAX_PDF_SIZE_MB` — tune there.
 - `/stats [days]` — admin analytics.
-- `/pitanja [days]` — admin-only. Lists every user question from the last N days (default 7, max 90) as `• <pitanje> (<ime or ID ...>)`. Uses `_split_html` for long lists. Questions truncated at `_QUESTION_PREVIEW_MAX` (200 chars). Also sent automatically every Monday 09:00 Europe/Belgrade by `_weekly_questions_job` (registered via `JobQueue.run_daily`, `days=(0,)`).
+- `/pitanja [days]` — admin-only. Lists every user question from the last N days (default 7, max 90) as `• <pitanje> (<ime or ID ...>)`. Uses `_split_html` for long lists. Questions truncated at `_QUESTION_PREVIEW_MAX` (200 chars). Also sent automatically every Monday 09:00 Europe/Belgrade by `_weekly_questions_job` (registered via `JobQueue.run_daily`, `days=(0,)`). After replying, it also injects the digest as a plain-text assistant turn into `_chat_history` (`_format_questions_digest_plain`) so admin follow-ups like "sumiraj top pitanja" can analyze it without re-querying — the system prompt has a matching out-of-scope exception that ends such answers with `[CONF:NA]`.
 - Markdown → HTML conversion. `_split_html` splits at 4096 chars respecting HTML tag boundaries.
 
 ### Analytics (`src/analytics.py`)
@@ -90,16 +97,32 @@ Two entry points: `bot.py` (Telegram bot + health server + Qdrant keepalive) and
 ### Qdrant Keep-alive (`src/qdrant_keepalive.py`)
 - Pings Qdrant every 6 hours to prevent free-tier cluster hibernation.
 
+### Health Server (`bot.py`)
+- aiohttp server on `:8080/health`. **Deep check**: probes Qdrant (`get_collections()`) + Cohere (`models.list(page_size=1)` — free metadata call, `check_api_key()` is deprecated since cohere 5.0), each 3s timeout. Returns `{"status": "ok"|"degraded", "services": {qdrant: {ok, info}, cohere: {ok, info}}}` — HTTP **200** if both OK, **503** if either fails. Result cached `_HEALTH_TTL_SECONDS` (60s) so the Dockerfile `HEALTHCHECK` (every 30s) doesn't hammer upstream APIs. Consumed by Docker healthcheck + UptimeRobot.
+- `bot.py` imports `_client` from `vector_store` and `embeddings` for the probes, and registers a log filter dropping `aiohttp.server` `BadHttpMessage` tracebacks — Mirai-style scanners hit `:8080` with malformed CGI exploits; the parser rejects them, no actionable signal, just noise.
+
 ## Deployment
 
-- `Dockerfile` — python:3.12-slim, health check on `:8080/health`, runs `bot.py`.
-- `docker-compose.yml` — single `bot` service, `unless-stopped`, mounts `data/`, `config.yaml`, `prompts/` as volumes. Port 8080 exposed.
-- Uses `docker-compose` v1 (EOL, not `docker compose` plugin). Use `down`+`up` instead of just `up -d` to avoid `ContainerConfig` bug on recreate.
+### Local (dev)
+- `Dockerfile` — python:3.12-slim, `HEALTHCHECK` on `:8080/health` (interval 30s, timeout 5s, 3 retries), runs `bot.py`.
+- `docker-compose.yml` — single `bot` service, `restart: unless-stopped`, mounts `data/`, `config.yaml`, `prompts/` as volumes. Port 8080 exposed. No healthcheck in compose (it's in the Dockerfile); `unless-stopped` restarts on crash/exit, NOT on `unhealthy`.
+- Local dev uses `docker-compose` v1 (EOL) — `down`+`up` instead of just `up -d` to avoid `ContainerConfig` bug on recreate.
+
+### Production (Hetzner — "MARI-MAR bot", first commercial deploy)
+- Server: Hetzner CPX22, IPv4 `178.105.109.233`, Ubuntu 24.04, app at `/opt/mari-mar-bot` owned by non-root `deploy` user. Repo pulled via GitHub deploy key (read-only). Hetzner project `mari-mar-bot` (ID 14507723); HCLOUD token in `~/.config/hcloud/cli.toml` is read-only — reboot via `ssh root@... systemctl reboot`, not `hcloud`.
+- Prod uses Docker (29.x) with the **`docker compose` v2 plugin** — `docker compose up -d --build` works normally on recreate (no v1 ContainerConfig bug). Log rotation via `/etc/docker/daemon.json` (json-file `max-size 10m`, `max-file 3`).
+- Hardening: UFW (allow 22 + 8080), fail2ban (sshd jail), unattended-upgrades, SSH password auth off, TZ Europe/Belgrade.
+- `.env` at `/opt/mari-mar-bot/.env` (chmod 600, gitignored — bot reads only ANTHROPIC/COHERE/QDRANT_URL/QDRANT_API_KEY/TELEGRAM_BOT_TOKEN). Rotate keys → `docker compose restart bot`.
+- Backups: daily cron `tar` of `data/` → `/var/backups/mari-mar-bot/data-YYYY-MM-DD.tar.gz` (7-day retention, `/usr/local/bin/mari-mar-bot-backup.sh` + `/etc/cron.d/mari-mar-bot-backup`). Hetzner Cloud Backups disabled by client cost decision — the cron tar is the compensation; intentional, not oversight.
+- **Update procedure: `./scripts/deploy.sh`** from the dev laptop (pre-flight checks local HEAD == origin/main, then ssh git pull --ff-only + `docker compose up -d --build` + health verify). Rollback: `ssh deploy@server "cd /opt/mari-mar-bot && git checkout <sha> && docker compose up -d --build"`. PDFs are NOT in the repo — re-upload via Telegram admin handler.
+- `./scripts/sync-data.sh <files>` migrates runtime state from local `data/` to prod: plain JSON (acl.json, invites.json) transfer with no downtime; `.db` files use Python `sqlite3.backup` snapshot + atomic swap with bot stopped (~5s). Both scripts honor `MARI_MAR_BOT_SERVER` env override.
+- Monitoring: UptimeRobot HTTP monitor on `:8080/health` (5-min interval, Telegram alert contact).
+- Full ops detail (troubleshooting, restore, key rotation, offboarding) → `docs/RUNBOOK.md`. Client-facing prereq docs → `docs/CLIENT_PREREQUISITES_*.md` (Hetzner doc appendix has the deployment status table + backlog).
 
 ## Configuration
 
-- `.env` — API keys: ANTHROPIC_API_KEY, COHERE_API_KEY, QDRANT_URL, QDRANT_API_KEY, TELEGRAM_BOT_TOKEN
-- `config.yaml` — model, max_tool_rounds, top_k, min_score (0.35), chunk_size (2000), embedding_dimensions, collection_name, rate limits, inactive_ttl_minutes (60). Chat ID lists are seed values only; live ACL is `data/acl.json`.
+- `.env` (gitignored) — the bot reads exactly five vars: ANTHROPIC_API_KEY, COHERE_API_KEY, QDRANT_URL, QDRANT_API_KEY, TELEGRAM_BOT_TOKEN. Any extra vars are ignored (don't park ops creds like HCLOUD tokens here — see `~/.config/hcloud/cli.toml`).
+- `config.yaml` — model, max_tool_rounds, top_k, min_score (0.35), chunk_size (2000), embedding_dimensions, collection_name, rate limits, inactive_ttl_minutes (60). Chat ID lists are seed values only; live ACL is `data/acl.json` (gitignored).
 - `prompts/system.txt` — Serbian system prompt (editable without deploy). LLM must end every response with one of `[CONF:HIGH|MED|LOW|NONE|NA]`; the prompt forbids writing disclaimers, napomene, or Mari-Mar contact info — those are appended in code by `_apply_disclaimer()`. Editing disclaimer wording or phone numbers = edit `_DISCLAIMERS` / `_CONTACT_BLOCK` in `telegram_handler.py`, not the prompt.
 
 ## Key Constraints
@@ -120,6 +143,7 @@ Two entry points: `bot.py` (Telegram bot + health server + Qdrant keepalive) and
 - `tests/test_tools_used.py`: `tools_used` annotation — verifies tool metadata lands in chat history but never in Telegram reply, annotation format, no-tools edge case.
 - `tests/test_document_handler.py`: path traversal sanitization, safe filename in delete, page-count warning suffix, chunk-overflow hard block (asserts embed/upsert not called), Qdrant quota branch vs generic Qdrant error fallthrough. Thresholds referenced via `telegram_handler._MAX_CHUNKS` / `_PAGE_WARN_THRESHOLD` so tests track constant changes.
 - `tests/test_invites.py`: invite token store + registration store — create, consume, expiry, double-consume, persistence, load, list_pending, used-entry pruning, registration CRUD, duplicate blocking, TTL pruning, backward compat.
+- `tests/test_questions_digest.py`: `get_recent_questions` window filtering, `_format_questions_digest` (HTML escape, truncation, named/unknown users), `_format_questions_digest_plain` (no HTML), `pitanja_handler` chat-history injection (default days, no injection on fetch error).
 - `test_local.py`: manual integration tests (PDF extraction, Cohere embeddings, agent). Requires API keys.
 
 ## Known Issues
@@ -127,3 +151,4 @@ Two entry points: `bot.py` (Telegram bot + health server + Qdrant keepalive) and
 - `min_score` threshold (0.35) was calibrated on a 12-chunk / 2-PDF corpus. Re-evaluate when corpus grows significantly — score distributions will shift.
 - Command definitions live in 3 places: `_USER_COMMANDS`/`_ADMIN_COMMANDS` (menu), `help_handler` (help text), `build_app()` (handler registration). Adding a command requires updating all three — no compile-time check. Accepted tradeoff at current command count.
 - Stale command scopes: if an admin is removed while bot is down, their Telegram menu retains admin commands until next bot restart (startup only sets scopes for current admins, doesn't clean up former ones).
+- `/health` deep check has no consecutive-failure debounce — a single transient Qdrant/Cohere blip flips it to 503 and can trip a UptimeRobot alert. The 60s result cache dampens flapping but doesn't eliminate it. Accepted tradeoff; revisit if alerts get noisy.
