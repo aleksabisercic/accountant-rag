@@ -119,7 +119,7 @@ async def run(messages: list[dict]) -> AgentResponse:
     for round_num in range(1, MAX_ROUNDS + 1):
         response = await _api_call_with_retry(
             model=MODEL,
-            max_tokens=5120,
+            max_tokens=8192,
             system=system,
             tools=tools,
             messages=messages,

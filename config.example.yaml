@@ -1,5 +1,5 @@
 agent:
-  model: claude-sonnet-4-6
+  model: claude-sonnet-5
   max_tool_rounds: 5
 
 retrieval:
