@@ -216,10 +216,10 @@ async def _notify_admins_invite_used(
     created_by: int,
 ) -> None:
     """Fire-and-forget: notify all admins that an invite was consumed."""
-    safe_label = html.escape(label)
+    # Sent as plain text (no parse_mode) — do not HTML-escape.
     text = (
         f"✅ Pozivnica iskorišćena\n"
-        f"Korisnik: {safe_label}\n"
+        f"Korisnik: {label}\n"
         f"Chat ID: {chat_id}\n"
         f"Pozivnicu kreirao: {_display_id(created_by)}"
     )
@@ -244,14 +244,13 @@ async def _notify_admins_registration(
     username: str | None,
 ) -> None:
     """Send registration request to all admins with inline approve/deny buttons."""
-    safe_name = html.escape(name)
-    safe_company = html.escape(company)
+    # Sent as plain text (no parse_mode) — do not HTML-escape.
     user_tag = f"@{username}" if username else "—"
     text = (
         f"🔔 Nov zahtev za pristup\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Ime: {safe_name}\n"
-        f"Firma: {safe_company}\n"
+        f"Ime: {name}\n"
+        f"Firma: {company}\n"
         f"Telegram: {user_tag}\n"
         f"ID: {chat_id}"
     )
@@ -350,8 +349,9 @@ async def _registration_callback(
 
     admin_name = acl.get_name(admin_id) or str(admin_id)
     now_str = datetime.now(ZoneInfo("Europe/Belgrade")).strftime("%d.%m. %H:%M")
-    safe_name = html.escape(reg["name"])
-    safe_company = html.escape(reg["company"])
+    # Edited messages below are sent with parse_mode=None — do not HTML-escape.
+    reg_name = reg["name"]
+    reg_company = reg["company"]
 
     if action == "reg_approve":
         label = f"{reg['company']} — {reg['name']}"
@@ -376,10 +376,10 @@ async def _registration_callback(
             await query.edit_message_text(
                 f"🔔 Nov zahtev za pristup\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"Ime: {safe_name}\n"
-                f"Firma: {safe_company}\n"
+                f"Ime: {reg_name}\n"
+                f"Firma: {reg_company}\n"
                 f"ID: {target_chat_id}\n\n"
-                f"✅ Odobrio: {html.escape(admin_name)} ({now_str})",
+                f"✅ Odobrio: {admin_name} ({now_str})",
                 parse_mode=None,
             )
         except BadRequest:
@@ -403,10 +403,10 @@ async def _registration_callback(
             await query.edit_message_text(
                 f"🔔 Nov zahtev za pristup\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"Ime: {safe_name}\n"
-                f"Firma: {safe_company}\n"
+                f"Ime: {reg_name}\n"
+                f"Firma: {reg_company}\n"
                 f"ID: {target_chat_id}\n\n"
-                f"❌ Odbio: {html.escape(admin_name)} ({now_str})",
+                f"❌ Odbio: {admin_name} ({now_str})",
                 parse_mode=None,
             )
         except BadRequest:
@@ -572,6 +572,9 @@ def _split_html(text: str, limit: int) -> list[str]:
     _TAG_RE = re.compile(r"<(/?)(\w+)(?:\s[^>]*)?>")
     chunks: list[str] = []
     pos = 0
+    # Closing tags are appended after the cut, so leave headroom to keep
+    # each chunk within the hard limit (Telegram rejects oversized messages).
+    budget = max(limit - 64, limit // 2, 1)
 
     while pos < len(text):
         if len(text) - pos <= limit:
@@ -579,9 +582,9 @@ def _split_html(text: str, limit: int) -> list[str]:
             break
 
         # Find last whitespace before the limit to avoid mid-word splits
-        split_at = text.rfind(" ", pos, pos + limit)
+        split_at = text.rfind(" ", pos, pos + budget)
         if split_at <= pos:
-            split_at = pos + limit
+            split_at = pos + budget
 
         # Walk back if we're inside an HTML tag (between < and >)
         bracket = text.rfind("<", pos, split_at)
@@ -658,6 +661,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             '• \u201eDo kada se podnosi prijava za godišnji porez na dohodak za 2025?\u201c\n'
             '• \u201eKoja je razlika između preduzetnika i DOO u pogledu poreza?\u201c\n'
             '• \u201eKoji je trenutni iznos minimalne zarade u Srbiji?\u201c'
+            f"\n\nVaš korisnički ID: {chat_id}"
         )
         return
 
@@ -883,10 +887,7 @@ async def dokumenti_handler(
 
     lines = ["<b>Dokumenti u bazi znanja:</b>\n"]
     for fn in sorted(docs):
-        if _is_admin(chat_id):
-            lines.append(f"• {html.escape(fn)}  ({docs[fn]} delova)")
-        else:
-            lines.append(f"• {html.escape(fn)}")
+        lines.append(f"• {html.escape(fn)}  ({docs[fn]} delova)")
 
     text = "\n".join(lines)
     for chunk in _split_html(text, 4096):
@@ -905,7 +906,10 @@ async def broadcast_handler(
         await update.message.reply_text("Upotreba: /broadcast <poruka>")
         return
 
-    message = "📢 Obaveštenje:\n\n" + " ".join(context.args)
+    # Take the raw text after the command — context.args splits on all
+    # whitespace and would flatten multi-line announcements into one line.
+    raw = (update.message.text or "").split(maxsplit=1)
+    message = "📢 Obaveštenje:\n\n" + (raw[1] if len(raw) > 1 else "")
 
     if len(message) > 4096:
         await update.message.reply_text(
@@ -1084,7 +1088,8 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     doc = update.message.document
-    if not doc.file_name.lower().endswith(".pdf"):
+    # file_name is optional in the Telegram API — guard before .lower()
+    if not doc.file_name or not doc.file_name.lower().endswith(".pdf"):
         await update.message.reply_text("Molim vas pošaljite PDF fajl.")
         return
 

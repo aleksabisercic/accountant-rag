@@ -91,13 +91,21 @@ async def log_escalation(chat_id: int, user_message: str, reason: str) -> None:
         logger.exception("Failed to log escalation for chat_id=%s", chat_id)
 
 
+def _sql_ts(dt: datetime) -> str:
+    """Format a datetime to match SQLite CURRENT_TIMESTAMP ('YYYY-MM-DD HH:MM:SS', UTC).
+
+    created_at is stored in that format, so cutoffs must use it too — an
+    isoformat() string ('...T...+00:00') compares incorrectly as a string.
+    """
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
 async def get_stats(days: int = 7) -> dict:
     """Return stats dict for the last N days."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-        prev_cutoff = (datetime.now(timezone.utc) - timedelta(days=days * 2)).isoformat()
-        now = datetime.now(timezone.utc).isoformat()
+        cutoff = _sql_ts(datetime.now(timezone.utc) - timedelta(days=days))
+        prev_cutoff = _sql_ts(datetime.now(timezone.utc) - timedelta(days=days * 2))
 
         # Current period
         row = await db.execute_fetchall(
@@ -156,7 +164,7 @@ async def get_stats(days: int = 7) -> dict:
 async def get_recent_questions(days: int) -> list[dict]:
     """Return all user questions from the last N days, oldest first."""
     async with aiosqlite.connect(DB_PATH) as db:
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        cutoff = _sql_ts(datetime.now(timezone.utc) - timedelta(days=days))
         rows = await db.execute_fetchall(
             """SELECT chat_id, user_message, created_at
                FROM queries WHERE created_at >= ?
