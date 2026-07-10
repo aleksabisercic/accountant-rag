@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 MODEL = CONFIG["agent"]["model"]
 MAX_ROUNDS = CONFIG["agent"]["max_tool_rounds"]
+MAX_TOKENS = CONFIG["agent"].get("max_tokens", 8192)
 SYSTEM_PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "system.txt"
 
 SEARCH_TOOL = {
@@ -119,7 +120,7 @@ async def run(messages: list[dict]) -> AgentResponse:
     for round_num in range(1, MAX_ROUNDS + 1):
         response = await _api_call_with_retry(
             model=MODEL,
-            max_tokens=8192,
+            max_tokens=MAX_TOKENS,
             system=system,
             tools=tools,
             messages=messages,
@@ -128,7 +129,11 @@ async def run(messages: list[dict]) -> AgentResponse:
         total_input += response.usage.input_tokens
         total_output += response.usage.output_tokens
 
-        if response.stop_reason == "end_turn":
+        # max_tokens/refusal are terminal: looping again would resend a history
+        # ending on an assistant turn, which the API rejects as a prefill.
+        if response.stop_reason in ("end_turn", "max_tokens", "refusal"):
+            if response.stop_reason != "end_turn":
+                logger.warning("agent stopped early: stop_reason=%s", response.stop_reason)
             text_parts = [b.text for b in response.content if b.type == "text"]
             for block in response.content:
                 if block.type == "text" and getattr(block, "citations", None):
@@ -162,7 +167,7 @@ async def run(messages: list[dict]) -> AgentResponse:
                 ",".join(sorted(tools_used)) or "none",
             )
             return AgentResponse(
-                text="\n".join(text_parts),
+                text="\n".join(text_parts) if text_parts else "Nisam uspeo da pronađem odgovor.",
                 sources=sources,
                 web_search_used=web_search_used,
                 tools_used=sorted(tools_used),
@@ -194,7 +199,12 @@ async def run(messages: list[dict]) -> AgentResponse:
                 tools_used.add("code_execution")
             elif block.type == "tool_use" and block.name == "search_documents":
                 tools_used.add("search_documents")
-                result_text = await _handle_search(block.input["query"])
+                # input can be incomplete if the response was cut off mid-block
+                query = block.input.get("query") if isinstance(block.input, dict) else None
+                if query:
+                    result_text = await _handle_search(query)
+                else:
+                    result_text = json.dumps({"results": [], "message": "Empty query."})
                 result_data = json.loads(result_text)
                 for r in result_data.get("results", []):
                     src = r.get("source", "")
@@ -214,11 +224,13 @@ async def run(messages: list[dict]) -> AgentResponse:
 
         messages.append({"role": "assistant", "content": response.content})
 
-        if response.stop_reason == "pause_turn":
+        # Pending tool_use blocks must be answered first — a pause_turn response
+        # can carry one, and leaving it unanswered fails the next API call.
+        if tool_results:
+            messages.append({"role": "user", "content": tool_results})
+        elif response.stop_reason == "pause_turn":
             # Code execution may pause for long-running turns — continue
             messages.append({"role": "user", "content": [{"type": "text", "text": "Continue."}]})
-        elif tool_results:
-            messages.append({"role": "user", "content": tool_results})
 
     text_parts = [b.text for b in response.content if b.type == "text"]
     logger.info(

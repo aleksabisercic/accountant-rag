@@ -1,6 +1,7 @@
 agent:
   model: claude-sonnet-5
   max_tool_rounds: 6
+  max_tokens: 8192
 
 retrieval:
   top_k: 10
