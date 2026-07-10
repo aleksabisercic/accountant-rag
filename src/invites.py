@@ -129,8 +129,21 @@ def add_registration(chat_id: int, name: str, company: str) -> bool:
 
 
 def get_registration(chat_id: int) -> dict | None:
-    """Return pending registration for chat_id, or None."""
-    return _store["registrations"].get(str(chat_id))
+    """Return pending registration for chat_id, or None.
+
+    Expiry is checked at read time — pruning only happens inside _save(), so
+    without this an ignored request would block re-registration forever.
+    """
+    reg = _store["registrations"].get(str(chat_id))
+    if reg is None:
+        return None
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=_REGISTRATION_TTL_HOURS)
+    created = datetime.fromisoformat(reg.get("created_at", "2000-01-01T00:00:00+00:00"))
+    if created <= cutoff:
+        _store["registrations"].pop(str(chat_id), None)
+        _save()
+        return None
+    return reg
 
 
 def resolve_registration(chat_id: int, approved_by: int | None = None) -> dict | None:

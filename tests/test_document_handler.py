@@ -57,7 +57,7 @@ def _patch_pipeline():
         patch("src.telegram_handler.pymupdf", fake_pymupdf),
         patch("src.telegram_handler.process_single_pdf_with_doc", return_value=("doc", chunks)),
         patch("src.telegram_handler.embed_documents", new_callable=AsyncMock, return_value=[[0.1] * 1024]),
-        patch("src.telegram_handler.delete_by_filename", new_callable=AsyncMock),
+        patch("src.telegram_handler.delete_stale_versions", new_callable=AsyncMock),
         patch("src.telegram_handler.upsert_chunks", new_callable=AsyncMock, return_value=1),
     ):
         yield
@@ -102,10 +102,13 @@ async def test_delete_uses_safe_name(admin_id, _patch_pipeline, tmp_path):
 
     with (
         patch("src.telegram_handler.PDF_DIR", tmp_path),
-        patch("src.telegram_handler.delete_by_filename", new_callable=AsyncMock) as mock_delete,
+        patch("src.telegram_handler.delete_stale_versions", new_callable=AsyncMock) as mock_delete,
     ):
         await document_handler(update, ctx)
-        mock_delete.assert_awaited_once_with("traversal.pdf")
+        mock_delete.assert_awaited_once()
+        args = mock_delete.await_args.args
+        assert args[0] == "traversal.pdf"
+        assert isinstance(args[1], str) and args[1]  # upload version tag
 
 
 @pytest.mark.asyncio
@@ -130,7 +133,7 @@ async def test_large_page_count_warns_in_success_message(admin_id, tmp_path):
         patch("src.telegram_handler.pymupdf", fake_pymupdf),
         patch("src.telegram_handler.process_single_pdf_with_doc", return_value=("doc", chunks)),
         patch("src.telegram_handler.embed_documents", new_callable=AsyncMock, return_value=[[0.1] * 1024]),
-        patch("src.telegram_handler.delete_by_filename", new_callable=AsyncMock),
+        patch("src.telegram_handler.delete_stale_versions", new_callable=AsyncMock),
         patch("src.telegram_handler.upsert_chunks", new_callable=AsyncMock, return_value=1),
     ):
         await document_handler(update, ctx)
@@ -186,7 +189,7 @@ async def test_chunk_count_over_limit_rejected_before_embedding(admin_id, tmp_pa
         patch("src.telegram_handler.pymupdf", fake_pymupdf),
         patch("src.telegram_handler.process_single_pdf_with_doc", return_value=("doc", oversized_chunks)),
         patch("src.telegram_handler.embed_documents", new_callable=AsyncMock) as mock_embed,
-        patch("src.telegram_handler.delete_by_filename", new_callable=AsyncMock) as mock_delete,
+        patch("src.telegram_handler.delete_stale_versions", new_callable=AsyncMock) as mock_delete,
         patch("src.telegram_handler.upsert_chunks", new_callable=AsyncMock) as mock_upsert,
     ):
         await document_handler(update, ctx)
@@ -231,7 +234,8 @@ async def test_qdrant_quota_error_shows_distinct_message(admin_id, tmp_path):
         patch("src.telegram_handler.pymupdf", fake_pymupdf),
         patch("src.telegram_handler.process_single_pdf_with_doc", return_value=("doc", chunks)),
         patch("src.telegram_handler.embed_documents", new_callable=AsyncMock, return_value=[[0.1] * 1024]),
-        patch("src.telegram_handler.delete_by_filename", new_callable=AsyncMock),
+        patch("src.telegram_handler.delete_stale_versions", new_callable=AsyncMock) as mock_stale,
+        patch("src.telegram_handler.delete_upload_version", new_callable=AsyncMock) as mock_cleanup,
         patch("src.telegram_handler.upsert_chunks", new_callable=AsyncMock, side_effect=quota_error),
     ):
         await document_handler(update, ctx)
@@ -239,6 +243,11 @@ async def test_qdrant_quota_error_shows_distinct_message(admin_id, tmp_path):
     calls = [c.args[0] for c in update.message.reply_text.await_args_list]
     assert any("Qdrant skladište je puno" in m for m in calls), calls
     assert not any("pokušajte ponovo" in m for m in calls), calls
+
+    # Failed upsert: the partial new version is swept, old points untouched
+    mock_cleanup.assert_awaited_once()
+    assert mock_cleanup.await_args.args[0] == "ok.pdf"
+    mock_stale.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -269,7 +278,8 @@ async def test_qdrant_non_quota_error_falls_through_to_generic(admin_id, tmp_pat
         patch("src.telegram_handler.pymupdf", fake_pymupdf),
         patch("src.telegram_handler.process_single_pdf_with_doc", return_value=("doc", chunks)),
         patch("src.telegram_handler.embed_documents", new_callable=AsyncMock, return_value=[[0.1] * 1024]),
-        patch("src.telegram_handler.delete_by_filename", new_callable=AsyncMock),
+        patch("src.telegram_handler.delete_stale_versions", new_callable=AsyncMock) as mock_stale,
+        patch("src.telegram_handler.delete_upload_version", new_callable=AsyncMock) as mock_cleanup,
         patch("src.telegram_handler.upsert_chunks", new_callable=AsyncMock, side_effect=server_error),
     ):
         await document_handler(update, ctx)
@@ -277,3 +287,64 @@ async def test_qdrant_non_quota_error_falls_through_to_generic(admin_id, tmp_pat
     calls = [c.args[0] for c in update.message.reply_text.await_args_list]
     assert any("pokušajte ponovo" in m for m in calls), calls
     assert not any("Qdrant skladište je puno" in m for m in calls), calls
+
+    # Failed upsert: the partial new version is swept, old points untouched
+    mock_cleanup.assert_awaited_once()
+    assert mock_cleanup.await_args.args[0] == "ok.pdf"
+    mock_stale.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_successful_upload_does_not_trigger_cleanup(admin_id, _patch_pipeline, tmp_path):
+    """The partial-upload sweep only runs when upsert fails."""
+    from src.telegram_handler import document_handler
+
+    update = _make_update(admin_id, "safe.pdf")
+    ctx = MagicMock()
+    ctx.bot.get_file = AsyncMock(return_value=AsyncMock())
+
+    with (
+        patch("src.telegram_handler.PDF_DIR", tmp_path),
+        patch("src.telegram_handler.delete_upload_version", new_callable=AsyncMock) as mock_cleanup,
+    ):
+        await document_handler(update, ctx)
+
+    mock_cleanup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_failure_does_not_mask_upsert_error(admin_id, tmp_path):
+    """If the sweep itself fails, the original upsert error still reaches the user."""
+    from qdrant_client.http.exceptions import UnexpectedResponse
+
+    from src.telegram_handler import document_handler
+
+    quota_error = UnexpectedResponse(
+        status_code=507,
+        reason_phrase="Insufficient Storage",
+        content=b"storage",
+        headers=None,
+    )
+    chunks = [
+        {"text": "c", "embedding_text": "c", "metadata": {"filename": "ok.pdf", "section": ""}}
+    ]
+    fake_pymupdf = MagicMock()
+    fake_pymupdf.open = _fake_pymupdf_open(page_count=10)
+
+    update = _make_update(admin_id, "ok.pdf")
+    ctx = MagicMock()
+    ctx.bot.get_file = AsyncMock(return_value=AsyncMock())
+
+    with (
+        patch("src.telegram_handler.PDF_DIR", tmp_path),
+        patch("src.telegram_handler.pymupdf", fake_pymupdf),
+        patch("src.telegram_handler.process_single_pdf_with_doc", return_value=("doc", chunks)),
+        patch("src.telegram_handler.embed_documents", new_callable=AsyncMock, return_value=[[0.1] * 1024]),
+        patch("src.telegram_handler.delete_stale_versions", new_callable=AsyncMock),
+        patch("src.telegram_handler.delete_upload_version", new_callable=AsyncMock, side_effect=RuntimeError("down")),
+        patch("src.telegram_handler.upsert_chunks", new_callable=AsyncMock, side_effect=quota_error),
+    ):
+        await document_handler(update, ctx)
+
+    calls = [c.args[0] for c in update.message.reply_text.await_args_list]
+    assert any("Qdrant skladište je puno" in m for m in calls), calls

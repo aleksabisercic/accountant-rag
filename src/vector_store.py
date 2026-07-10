@@ -56,6 +56,59 @@ async def upsert_chunks(
     return len(points)
 
 
+async def delete_stale_versions(filename: str, keep_version: str) -> None:
+    """Delete all points for a filename EXCEPT the given upload version.
+
+    Enables safe replace: upsert the new version first, then sweep the old
+    points — a failed upload never destroys the existing document.
+    """
+    await _client.delete(
+        collection_name=COLLECTION,
+        points_selector=models.FilterSelector(
+            filter=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="filename",
+                        match=models.MatchValue(value=filename),
+                    )
+                ],
+                must_not=[
+                    models.FieldCondition(
+                        key="upload_version",
+                        match=models.MatchValue(value=keep_version),
+                    )
+                ],
+            )
+        ),
+    )
+
+
+async def delete_upload_version(filename: str, upload_version: str) -> None:
+    """Delete only the points of a specific upload version for a filename.
+
+    Cleanup for a partially failed upsert: sweeps the incomplete new version
+    so it doesn't linger as duplicate chunks eating quota, while the old
+    version stays untouched.
+    """
+    await _client.delete(
+        collection_name=COLLECTION,
+        points_selector=models.FilterSelector(
+            filter=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="filename",
+                        match=models.MatchValue(value=filename),
+                    ),
+                    models.FieldCondition(
+                        key="upload_version",
+                        match=models.MatchValue(value=upload_version),
+                    ),
+                ],
+            )
+        ),
+    )
+
+
 async def delete_by_filename(filename: str) -> None:
     await _client.delete(
         collection_name=COLLECTION,

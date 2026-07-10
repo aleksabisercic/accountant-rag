@@ -3,6 +3,7 @@ import html
 import logging
 import re
 import time
+import uuid
 from collections import defaultdict
 from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
@@ -39,7 +40,7 @@ from src.config import CONFIG, TELEGRAM_BOT_TOKEN
 from src.embeddings import embed_documents
 from src.contextualizer import contextualize_chunks
 from src.pdf_loader import ScannedPDFError, process_single_pdf_with_doc
-from src.vector_store import delete_by_filename, upsert_chunks
+from src.vector_store import delete_stale_versions, delete_upload_version, upsert_chunks
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +164,23 @@ _chat_history: dict[int, list[dict]] = defaultdict(list)
 _rate_timestamps: dict[int, list[float]] = defaultdict(list)
 _last_activity: dict[int, float] = {}
 
+# The event loop keeps only weak refs to tasks — an unreferenced
+# fire-and-forget task can be GC'd mid-flight and silently dropped.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn(coro) -> asyncio.Task:
+    """create_task with a strong reference held until completion."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+# PyMuPDF is not thread-safe — concurrent admin uploads must not parse PDFs
+# in parallel worker threads (risk of interpreter crash).
+_pdf_parse_lock = asyncio.Lock()
+
 # Registration form state (in-memory, lost on restart — acceptable)
 _REG_ASK_NAME = "ask_name"
 _REG_ASK_COMPANY = "ask_company"
@@ -223,12 +241,14 @@ async def _notify_admins_escalation(
 ) -> None:
     """Fire-and-forget: notify all admins of an escalation."""
     name = acl.get_name(chat_id) or str(chat_id)
-    # Truncate bot response to keep notification readable
+    # Truncate both parts — a 4000-char question plus the preview would push
+    # the notification past Telegram's 4096 limit and it would never arrive.
+    question_preview = user_text[:1000] + "..." if len(user_text) > 1000 else user_text
     response_preview = bot_response[:500] + "..." if len(bot_response) > 500 else bot_response
     text = (
         f"⚠️ Eskalacija\n"
         f"Korisnik: {name}\n"
-        f"Pitanje: {user_text}\n\n"
+        f"Pitanje: {question_preview}\n\n"
         f"Odgovor bota:\n{response_preview}"
     )
     for admin_id in acl.get_admins():
@@ -245,10 +265,10 @@ async def _notify_admins_invite_used(
     created_by: int,
 ) -> None:
     """Fire-and-forget: notify all admins that an invite was consumed."""
-    safe_label = html.escape(label)
+    # Sent as plain text (no parse_mode) — do not HTML-escape.
     text = (
         f"✅ Pozivnica iskorišćena\n"
-        f"Korisnik: {safe_label}\n"
+        f"Korisnik: {label}\n"
         f"Chat ID: {chat_id}\n"
         f"Pozivnicu kreirao: {_display_id(created_by)}"
     )
@@ -273,14 +293,13 @@ async def _notify_admins_registration(
     username: str | None,
 ) -> None:
     """Send registration request to all admins with inline approve/deny buttons."""
-    safe_name = html.escape(name)
-    safe_company = html.escape(company)
+    # Sent as plain text (no parse_mode) — do not HTML-escape.
     user_tag = f"@{username}" if username else "—"
     text = (
         f"🔔 Nov zahtev za pristup\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Ime: {safe_name}\n"
-        f"Firma: {safe_company}\n"
+        f"Ime: {name}\n"
+        f"Firma: {company}\n"
         f"Telegram: {user_tag}\n"
         f"ID: {chat_id}"
     )
@@ -338,7 +357,7 @@ async def _handle_registration_step(
             "Administrator će vas odobriti u najkraćem roku."
         )
         username = update.effective_user.username if update.effective_user else None
-        asyncio.create_task(
+        _spawn(
             _notify_admins_registration(context, chat_id, name, company, username)
         )
         return True
@@ -379,8 +398,9 @@ async def _registration_callback(
 
     admin_name = acl.get_name(admin_id) or str(admin_id)
     now_str = datetime.now(ZoneInfo("Europe/Belgrade")).strftime("%d.%m. %H:%M")
-    safe_name = html.escape(reg["name"])
-    safe_company = html.escape(reg["company"])
+    # Edited messages below are sent with parse_mode=None — do not HTML-escape.
+    reg_name = reg["name"]
+    reg_company = reg["company"]
 
     if action == "reg_approve":
         label = f"{reg['company']} — {reg['name']}"
@@ -405,10 +425,10 @@ async def _registration_callback(
             await query.edit_message_text(
                 f"🔔 Nov zahtev za pristup\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"Ime: {safe_name}\n"
-                f"Firma: {safe_company}\n"
+                f"Ime: {reg_name}\n"
+                f"Firma: {reg_company}\n"
                 f"ID: {target_chat_id}\n\n"
-                f"✅ Odobrio: {html.escape(admin_name)} ({now_str})",
+                f"✅ Odobrio: {admin_name} ({now_str})",
                 parse_mode=None,
             )
         except BadRequest:
@@ -432,10 +452,10 @@ async def _registration_callback(
             await query.edit_message_text(
                 f"🔔 Nov zahtev za pristup\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"Ime: {safe_name}\n"
-                f"Firma: {safe_company}\n"
+                f"Ime: {reg_name}\n"
+                f"Firma: {reg_company}\n"
                 f"ID: {target_chat_id}\n\n"
-                f"❌ Odbio: {html.escape(admin_name)} ({now_str})",
+                f"❌ Odbio: {admin_name} ({now_str})",
                 parse_mode=None,
             )
         except BadRequest:
@@ -449,7 +469,13 @@ async def _registration_callback(
 def _trim_history(chat_id: int) -> None:
     history = _chat_history[chat_id]
     if len(history) > MAX_HISTORY * 2:
-        _chat_history[chat_id] = history[-(MAX_HISTORY * 2):]
+        trimmed = history[-(MAX_HISTORY * 2):]
+        # The API requires the first message to be a user turn — trimming an
+        # odd-length history (user just appended) would otherwise leave a
+        # leading assistant entry and 400 every call until /clear.
+        while trimmed and trimmed[0]["role"] != "user":
+            trimmed.pop(0)
+        _chat_history[chat_id] = trimmed
 
 
 def _render_table(table_lines: list[str]) -> str:
@@ -584,6 +610,9 @@ def _format_sources(sources: list[Source]) -> str:
 
 async def _send_long(update: Update, text: str, sources_html: str = "") -> None:
     text = _md_to_html(text) + sources_html
+    if not text.strip():
+        # reply_text("") raises — e.g. a response that was only a [CONF:*] marker
+        text = "Nemam odgovor na ovo pitanje. Pokušajte da ga preformulišete."
     limit = 4096
     chunks = _split_html(text, limit)
     for chunk in chunks:
@@ -601,6 +630,9 @@ def _split_html(text: str, limit: int) -> list[str]:
     _TAG_RE = re.compile(r"<(/?)(\w+)(?:\s[^>]*)?>")
     chunks: list[str] = []
     pos = 0
+    # Closing tags are appended after the cut, so leave headroom to keep
+    # each chunk within the hard limit (Telegram rejects oversized messages).
+    budget = max(limit - 64, limit // 2, 1)
 
     while pos < len(text):
         if len(text) - pos <= limit:
@@ -608,14 +640,18 @@ def _split_html(text: str, limit: int) -> list[str]:
             break
 
         # Find last whitespace before the limit to avoid mid-word splits
-        split_at = text.rfind(" ", pos, pos + limit)
+        split_at = text.rfind(" ", pos, pos + budget)
         if split_at <= pos:
-            split_at = pos + limit
+            split_at = pos + budget
 
         # Walk back if we're inside an HTML tag (between < and >)
         bracket = text.rfind("<", pos, split_at)
         if bracket != -1 and ">" not in text[bracket:split_at]:
             split_at = bracket
+        # A single tag longer than the budget would walk split_at back to pos
+        # and loop forever — force progress even if it breaks that tag.
+        if split_at <= pos:
+            split_at = pos + budget
 
         chunk = text[pos:split_at]
 
@@ -662,6 +698,9 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
         label = invite["label"]
         acl.add_user(chat_id, label)
+        # Clear any pending registration so a stale admin card can't later
+        # send this now-active client a "request denied" message.
+        invites.remove_registration(chat_id)
         safe_label = html.escape(label)
         await update.message.reply_text(
             f"Dobrodošli, <b>{safe_label}</b>! 🎉\n\n"
@@ -672,7 +711,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             f'• \u201eKoji je trenutni iznos minimalne zarade u Srbiji?\u201c',
             parse_mode=ParseMode.HTML,
         )
-        asyncio.create_task(
+        _spawn(
             _notify_admins_invite_used(context, chat_id, label, invite["created_by"])
         )
         return
@@ -687,6 +726,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             '• \u201eDo kada se podnosi prijava za godišnji porez na dohodak za 2025?\u201c\n'
             '• \u201eKoja je razlika između preduzetnika i DOO u pogledu poreza?\u201c\n'
             '• \u201eKoji je trenutni iznos minimalne zarade u Srbiji?\u201c'
+            f"\n\nVaš korisnički ID: {chat_id}"
         )
         return
 
@@ -728,6 +768,8 @@ async def adduser_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     name = " ".join(context.args[1:]) or None
     result = acl.add_user(user_id, name)
+    # Access granted manually — drop any pending registration for this user
+    invites.remove_registration(user_id)
     display = _display_id(user_id)
     if result == "added":
         await update.message.reply_text(f"✓ Korisnik {display} je dodat.")
@@ -912,10 +954,7 @@ async def dokumenti_handler(
 
     lines = ["<b>Dokumenti u bazi znanja:</b>\n"]
     for fn in sorted(docs):
-        if _is_admin(chat_id):
-            lines.append(f"• {html.escape(fn)}  ({docs[fn]} delova)")
-        else:
-            lines.append(f"• {html.escape(fn)}")
+        lines.append(f"• {html.escape(fn)}  ({docs[fn]} delova)")
 
     text = "\n".join(lines)
     for chunk in _split_html(text, 4096):
@@ -934,7 +973,10 @@ async def broadcast_handler(
         await update.message.reply_text("Upotreba: /broadcast <poruka>")
         return
 
-    message = "📢 Obaveštenje:\n\n" + " ".join(context.args)
+    # Take the raw text after the command — context.args splits on all
+    # whitespace and would flatten multi-line announcements into one line.
+    raw = (update.message.text or "").split(maxsplit=1)
+    message = "📢 Obaveštenje:\n\n" + (raw[1] if len(raw) > 1 else "")
 
     if len(message) > 4096:
         await update.message.reply_text(
@@ -985,7 +1027,7 @@ async def broadcast_handler(
         except Exception:
             logger.exception("Failed to send broadcast summary to admin %s", chat_id)
 
-    asyncio.create_task(_do_broadcast())
+    _spawn(_do_broadcast())
 
 
 async def clear_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1115,7 +1157,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _send_long(update, reply, sources_html)
 
         response_time_ms = int((time.monotonic() - t0) * 1000)
-        asyncio.create_task(
+        _spawn(
             log_query(
                 chat_id=chat_id,
                 user_message=user_text,
@@ -1129,8 +1171,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         if conf_level in _ESCALATE_LEVELS:
             reason = f"CONF:{conf_level} | {clean_text[:50]}"
-            asyncio.create_task(log_escalation(chat_id, user_text, reason))
-            asyncio.create_task(
+            _spawn(log_escalation(chat_id, user_text, reason))
+            _spawn(
                 _notify_admins_escalation(context, chat_id, user_text, clean_text)
             )
     except Exception:
@@ -1160,7 +1202,8 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     doc = update.message.document
-    if not doc.file_name.lower().endswith(".pdf"):
+    # file_name is optional in the Telegram API — guard before .lower()
+    if not doc.file_name or not doc.file_name.lower().endswith(".pdf"):
         await update.message.reply_text("Molim vas pošaljite PDF fajl.")
         return
 
@@ -1180,11 +1223,22 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         pdf_path = PDF_DIR / safe_name
         await file.download_to_drive(str(pdf_path))
 
-        with pymupdf.open(pdf_path) as _pdf:
-            page_count = _pdf.page_count
+        # PDF parsing is CPU-bound — run it off the event loop so the bot
+        # keeps answering messages and health checks during large uploads.
+        # PyMuPDF is not thread-safe, so concurrent uploads must not parse
+        # in parallel threads — serialize via the module-level lock.
+        def _read_page_count() -> int:
+            with pymupdf.open(pdf_path) as _pdf:
+                return _pdf.page_count
+
+        async with _pdf_parse_lock:
+            page_count = await asyncio.to_thread(_read_page_count)
 
         try:
-            full_doc, chunks = process_single_pdf_with_doc(pdf_path)
+            async with _pdf_parse_lock:
+                full_doc, chunks = await asyncio.to_thread(
+                    process_single_pdf_with_doc, pdf_path
+                )
         except ScannedPDFError:
             await update.message.reply_text(
                 f"❌ {safe_name} — skenirani PDF, potreban je tekstualni PDF"
@@ -1206,12 +1260,32 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             chunks = await contextualize_chunks(full_doc, chunks)
 
         embed_texts = [c.get("contextualized_text", c.get("embedding_text", c["text"])) for c in chunks]
-        metadatas = [c["metadata"] for c in chunks]
         vectors = await embed_documents(embed_texts)
         original_texts = [c["text"] for c in chunks]
 
-        await delete_by_filename(safe_name)
-        count = await upsert_chunks(original_texts, vectors, metadatas)
+        # Safe replace: tag the new upload, upsert it, and only then delete
+        # the old points. A failed upsert (quota, network) can no longer
+        # destroy the existing document — worst case old+new coexist until
+        # the next successful upload sweeps stale versions.
+        upload_version = uuid.uuid4().hex
+        metadatas = [
+            {**c["metadata"], "upload_version": upload_version} for c in chunks
+        ]
+        try:
+            count = await upsert_chunks(original_texts, vectors, metadatas)
+        except Exception:
+            # Batched upsert can fail partway (quota, network) — sweep the
+            # incomplete new version so it doesn't linger as duplicate chunks
+            # eating quota. Deletes don't need free storage, so this works
+            # even when the failure was the quota itself.
+            try:
+                await delete_upload_version(safe_name, upload_version)
+            except Exception:
+                logger.exception(
+                    "Cleanup of partial upload %s (%s) failed", safe_name, upload_version
+                )
+            raise
+        await delete_stale_versions(safe_name, upload_version)
 
         success_msg = f"✅ {safe_name} — {count} delova indeksirano"
         if page_count > _PAGE_WARN_THRESHOLD:

@@ -135,9 +135,12 @@ async def run(messages: list[dict], on_progress=None) -> AgentResponse:
         total_input += response.usage.input_tokens
         total_output += response.usage.output_tokens
 
-        # max_tokens/refusal are terminal: looping again would resend a history
-        # ending on an assistant turn, which the API rejects as a prefill.
-        if response.stop_reason in ("end_turn", "max_tokens", "refusal"):
+        # Non-end_turn reasons here are terminal: looping again would resend a
+        # history ending on an assistant turn, which the API rejects as a prefill.
+        if response.stop_reason in (
+            "end_turn", "max_tokens", "refusal",
+            "stop_sequence", "model_context_window_exceeded",
+        ):
             if response.stop_reason != "end_turn":
                 logger.warning("agent stopped early: stop_reason=%s", response.stop_reason)
             text_parts = [b.text for b in response.content if b.type == "text"]
@@ -213,7 +216,18 @@ async def run(messages: list[dict], on_progress=None) -> AgentResponse:
                 # input can be incomplete if the response was cut off mid-block
                 query = block.input.get("query") if isinstance(block.input, dict) else None
                 if query:
-                    result_text = await _handle_search(query)
+                    try:
+                        result_text = await _handle_search(query)
+                    except Exception:
+                        # Qdrant/Cohere outage (free-tier hibernation, network)
+                        # must not kill the whole reply — surface it as a tool
+                        # error so the model can fall back to web search.
+                        logger.exception("search_documents failed for query: %s", query)
+                        result_text = json.dumps({
+                            "results": [],
+                            "message": "Document search is temporarily unavailable. "
+                                       "Use web search or answer from context.",
+                        })
                 else:
                     result_text = json.dumps({"results": [], "message": "Empty query."})
                 result_data = json.loads(result_text)
@@ -245,9 +259,9 @@ async def run(messages: list[dict], on_progress=None) -> AgentResponse:
         # can carry one, and leaving it unanswered fails the next API call.
         if tool_results:
             messages.append({"role": "user", "content": tool_results})
-        elif response.stop_reason == "pause_turn":
-            # Code execution may pause for long-running turns — continue
-            messages.append({"role": "user", "content": [{"type": "text", "text": "Continue."}]})
+        # pause_turn with no client tool_use: resend history as-is — the API
+        # detects the trailing server_tool_use block and resumes automatically;
+        # injecting an extra user message ("Continue.") breaks the resume.
 
     text_parts = [b.text for b in response.content if b.type == "text"]
     logger.info(
