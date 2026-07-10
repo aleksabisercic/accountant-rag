@@ -57,7 +57,7 @@ def _patch_pipeline():
         patch("src.telegram_handler.pymupdf", fake_pymupdf),
         patch("src.telegram_handler.process_single_pdf_with_doc", return_value=("doc", chunks)),
         patch("src.telegram_handler.embed_documents", new_callable=AsyncMock, return_value=[[0.1] * 1024]),
-        patch("src.telegram_handler.delete_by_filename", new_callable=AsyncMock),
+        patch("src.telegram_handler.delete_stale_versions", new_callable=AsyncMock),
         patch("src.telegram_handler.upsert_chunks", new_callable=AsyncMock, return_value=1),
     ):
         yield
@@ -102,10 +102,13 @@ async def test_delete_uses_safe_name(admin_id, _patch_pipeline, tmp_path):
 
     with (
         patch("src.telegram_handler.PDF_DIR", tmp_path),
-        patch("src.telegram_handler.delete_by_filename", new_callable=AsyncMock) as mock_delete,
+        patch("src.telegram_handler.delete_stale_versions", new_callable=AsyncMock) as mock_delete,
     ):
         await document_handler(update, ctx)
-        mock_delete.assert_awaited_once_with("traversal.pdf")
+        mock_delete.assert_awaited_once()
+        args = mock_delete.await_args.args
+        assert args[0] == "traversal.pdf"
+        assert isinstance(args[1], str) and args[1]  # upload version tag
 
 
 @pytest.mark.asyncio
@@ -130,7 +133,7 @@ async def test_large_page_count_warns_in_success_message(admin_id, tmp_path):
         patch("src.telegram_handler.pymupdf", fake_pymupdf),
         patch("src.telegram_handler.process_single_pdf_with_doc", return_value=("doc", chunks)),
         patch("src.telegram_handler.embed_documents", new_callable=AsyncMock, return_value=[[0.1] * 1024]),
-        patch("src.telegram_handler.delete_by_filename", new_callable=AsyncMock),
+        patch("src.telegram_handler.delete_stale_versions", new_callable=AsyncMock),
         patch("src.telegram_handler.upsert_chunks", new_callable=AsyncMock, return_value=1),
     ):
         await document_handler(update, ctx)
@@ -186,7 +189,7 @@ async def test_chunk_count_over_limit_rejected_before_embedding(admin_id, tmp_pa
         patch("src.telegram_handler.pymupdf", fake_pymupdf),
         patch("src.telegram_handler.process_single_pdf_with_doc", return_value=("doc", oversized_chunks)),
         patch("src.telegram_handler.embed_documents", new_callable=AsyncMock) as mock_embed,
-        patch("src.telegram_handler.delete_by_filename", new_callable=AsyncMock) as mock_delete,
+        patch("src.telegram_handler.delete_stale_versions", new_callable=AsyncMock) as mock_delete,
         patch("src.telegram_handler.upsert_chunks", new_callable=AsyncMock) as mock_upsert,
     ):
         await document_handler(update, ctx)
@@ -231,7 +234,7 @@ async def test_qdrant_quota_error_shows_distinct_message(admin_id, tmp_path):
         patch("src.telegram_handler.pymupdf", fake_pymupdf),
         patch("src.telegram_handler.process_single_pdf_with_doc", return_value=("doc", chunks)),
         patch("src.telegram_handler.embed_documents", new_callable=AsyncMock, return_value=[[0.1] * 1024]),
-        patch("src.telegram_handler.delete_by_filename", new_callable=AsyncMock),
+        patch("src.telegram_handler.delete_stale_versions", new_callable=AsyncMock),
         patch("src.telegram_handler.upsert_chunks", new_callable=AsyncMock, side_effect=quota_error),
     ):
         await document_handler(update, ctx)
@@ -269,7 +272,7 @@ async def test_qdrant_non_quota_error_falls_through_to_generic(admin_id, tmp_pat
         patch("src.telegram_handler.pymupdf", fake_pymupdf),
         patch("src.telegram_handler.process_single_pdf_with_doc", return_value=("doc", chunks)),
         patch("src.telegram_handler.embed_documents", new_callable=AsyncMock, return_value=[[0.1] * 1024]),
-        patch("src.telegram_handler.delete_by_filename", new_callable=AsyncMock),
+        patch("src.telegram_handler.delete_stale_versions", new_callable=AsyncMock),
         patch("src.telegram_handler.upsert_chunks", new_callable=AsyncMock, side_effect=server_error),
     ):
         await document_handler(update, ctx)

@@ -124,7 +124,9 @@ async def get_stats(days: int = 7) -> dict:
             (cutoff,),
         )
         escalation_count = esc_row[0][0] or 0
-        answered_count = question_count  # all queries are answered (escalations are separate)
+        # Escalated queries also produce a reply, but counting them as
+        # "answered" would double-count them in the percentage split.
+        answered_count = max(question_count - escalation_count, 0)
 
         # Previous period for week-over-week
         prev_row = await db.execute_fetchall(

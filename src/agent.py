@@ -205,7 +205,18 @@ async def run(messages: list[dict]) -> AgentResponse:
                 # input can be incomplete if the response was cut off mid-block
                 query = block.input.get("query") if isinstance(block.input, dict) else None
                 if query:
-                    result_text = await _handle_search(query)
+                    try:
+                        result_text = await _handle_search(query)
+                    except Exception:
+                        # Qdrant/Cohere outage (free-tier hibernation, network)
+                        # must not kill the whole reply — surface it as a tool
+                        # error so the model can fall back to web search.
+                        logger.exception("search_documents failed for query: %s", query)
+                        result_text = json.dumps({
+                            "results": [],
+                            "message": "Document search is temporarily unavailable. "
+                                       "Use web search or answer from context.",
+                        })
                 else:
                     result_text = json.dumps({"results": [], "message": "Empty query."})
                 result_data = json.loads(result_text)
