@@ -1345,7 +1345,10 @@ def _format_stats(stats: dict, header: str) -> str:
         lines.append("Poslednje eskalacije:")
         for i, r in enumerate(recent_esc, 1):
             ts = r["created_at"][:16].replace("T", " ") if r["created_at"] else ""
-            lines.append(f"  {i}. {r['reason']} ({ts})")
+            q = r["question"]
+            if len(q) > 60:
+                q = q[:60] + "…"
+            lines.append(f"  {i}. {r['conf']} | {q} ({ts})")
 
     avg_s = stats["avg_response_time_ms"] / 1000 if stats["avg_response_time_ms"] else 0
     lines.append("")

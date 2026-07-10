@@ -140,15 +140,23 @@ async def get_stats(days: int = 7) -> dict:
         else:
             wow_change = None  # no previous data
 
-        # Recent escalations (newest first)
+        # Recent escalations (newest first). The reason column embeds a
+        # preview of the bot's ANSWER ("CONF:LOW | <reply…>") — admins want
+        # the user's QUESTION, so surface user_message and keep only the
+        # CONF tag from reason.
         esc_rows = await db.execute_fetchall(
-            """SELECT reason, created_at
+            """SELECT user_message, reason, created_at
                FROM escalations WHERE created_at >= ?
                ORDER BY created_at DESC LIMIT 5""",
             (cutoff,),
         )
         recent_escalations = [
-            {"reason": r[0] or "nepoznato", "created_at": r[1]} for r in esc_rows
+            {
+                "question": r[0] or "",
+                "conf": (r[1] or "").split(" | ", 1)[0] or "nepoznato",
+                "created_at": r[2],
+            }
+            for r in esc_rows
         ]
 
         return {
