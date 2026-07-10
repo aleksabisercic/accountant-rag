@@ -103,7 +103,13 @@ async def _api_call_with_retry(**kwargs):
     return await _client.messages.create(**kwargs)
 
 
-async def run(messages: list[dict]) -> AgentResponse:
+async def run(messages: list[dict], on_progress=None) -> AgentResponse:
+    """Run the agent loop.
+
+    on_progress: optional async callable (round_num, tools_this_round) invoked
+    after each non-terminal round, so a frontend can surface progress. Errors
+    in the callback are logged and never interrupt the loop.
+    """
     system = _load_system_prompt()
     tools = [
         {"type": "web_search_20260209", "name": "web_search", "max_uses": 3},
@@ -180,10 +186,12 @@ async def run(messages: list[dict]) -> AgentResponse:
         # Server-side tools (code_execution, web_search) are handled by the API
         # — their results are already in response.content, no tool_result needed.
         tool_results = []
+        round_tools: set[str] = set()
         for block in response.content:
             if block.type == "web_search_tool_result":
                 web_search_used = True
                 tools_used.add("web_search")
+                round_tools.add("web_search")
             elif block.type == "server_tool_use":
                 # Sub-tools bash_code_execution / text_editor_code_execution
                 # normalize to "code_execution" for clean tracking
@@ -191,14 +199,17 @@ async def run(messages: list[dict]) -> AgentResponse:
                 if name in ("code_execution", "bash_code_execution", "text_editor_code_execution"):
                     name = "code_execution"
                 tools_used.add(name)
+                round_tools.add(name)
                 logger.debug("server_tool_use: %s (raw: %s)", name, block.name)
             elif block.type in (
                 "bash_code_execution_tool_result",
                 "text_editor_code_execution_tool_result",
             ):
                 tools_used.add("code_execution")
+                round_tools.add("code_execution")
             elif block.type == "tool_use" and block.name == "search_documents":
                 tools_used.add("search_documents")
+                round_tools.add("search_documents")
                 # input can be incomplete if the response was cut off mid-block
                 query = block.input.get("query") if isinstance(block.input, dict) else None
                 if query:
@@ -223,6 +234,12 @@ async def run(messages: list[dict]) -> AgentResponse:
                 })
 
         messages.append({"role": "assistant", "content": response.content})
+
+        if on_progress is not None:
+            try:
+                await on_progress(round_num, sorted(round_tools))
+            except Exception:
+                logger.warning("on_progress callback failed", exc_info=True)
 
         # Pending tool_use blocks must be answered first — a pause_turn response
         # can carry one, and leaving it unanswered fails the next API call.

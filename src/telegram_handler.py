@@ -62,6 +62,24 @@ _INACTIVE_TTL_S = CONFIG["telegram"].get("inactive_ttl_minutes", 60) * 60  # sec
 _CONF_PATTERN = re.compile(r"\[CONF:(HIGH|MED|LOW|NONE|NA)\]\s*$", re.IGNORECASE)
 _ESCALATE_LEVELS = frozenset({"LOW", "NONE"})
 
+# Progress statuses shown (and edited in place) while the agent works.
+# Client constraint: wording must never reveal internet/web usage —
+# web_search maps to a generic "checking additional sources" phrase.
+_STATUS_INITIAL = "⏳ Analiziram vaše pitanje…"
+_STATUS_BY_TOOL = [
+    ("search_documents", "📚 Pretražujem dokumentaciju…"),
+    ("web_search", "🔎 Proveravam dodatne izvore…"),
+    ("code_execution", "🧮 Obrađujem podatke…"),
+]
+_STATUS_DEFAULT = "✍️ Pripremam odgovor…"
+
+
+def _status_for_tools(tools: list[str]) -> str:
+    for tool, status in _STATUS_BY_TOOL:
+        if tool in tools:
+            return status
+    return _STATUS_DEFAULT
+
 _CONTACT_BLOCK = (
     "\n\nZakažite konsultacije:\n"
     "Kalendar i kontakt:\n"
@@ -1017,10 +1035,29 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await asyncio.sleep(4)
 
     typing_task = asyncio.create_task(keep_typing())
+
+    status_msg = None
+    try:
+        status_msg = await update.message.reply_text(_STATUS_INITIAL)
+    except Exception:
+        logger.warning("failed to send status message to %s", chat_id, exc_info=True)
+
+    last_status = _STATUS_INITIAL
+
+    async def on_progress(round_num: int, tools: list[str]) -> None:
+        nonlocal last_status
+        if status_msg is None:
+            return
+        text = _status_for_tools(tools)
+        if text == last_status:
+            return  # editing with identical text raises BadRequest
+        last_status = text
+        await status_msg.edit_text(text)
+
     t0 = time.monotonic()
     try:
         messages = list(_chat_history[chat_id])
-        result: AgentResponse = await agent_run(messages)
+        result: AgentResponse = await agent_run(messages, on_progress=on_progress)
 
         reply, conf_level = _apply_disclaimer(result.text)
         clean_text = _strip_sentinel(result.text)
@@ -1075,6 +1112,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
     finally:
         typing_task.cancel()
+        if status_msg is not None:
+            try:
+                await status_msg.delete()
+            except Exception:
+                logger.warning("failed to delete status message in %s", chat_id, exc_info=True)
 
 
 async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
