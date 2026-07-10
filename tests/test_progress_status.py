@@ -11,6 +11,7 @@ from src.telegram_handler import (
     _STATUS_BY_TOOL,
     _STATUS_DEFAULT,
     _STATUS_INITIAL,
+    _STATUS_ROTATION,
     _status_for_tools,
 )
 
@@ -37,7 +38,11 @@ def test_unknown_tool_falls_back_to_default():
 
 def test_no_status_mentions_internet():
     """Client constraint: user-facing statuses must never reveal internet/web usage."""
-    all_statuses = [_STATUS_INITIAL, _STATUS_DEFAULT] + [s for _, s in _STATUS_BY_TOOL]
+    all_statuses = (
+        [_STATUS_INITIAL, _STATUS_DEFAULT]
+        + [s for _, s in _STATUS_BY_TOOL]
+        + _STATUS_ROTATION
+    )
     for status in all_statuses:
         lowered = status.lower()
         for forbidden in ("internet", "web", "mrež", "online", "google"):
@@ -176,6 +181,63 @@ async def test_status_message_deleted_when_agent_fails():
 
         await message_handler(update, MagicMock())
 
+    status_msg.delete.assert_awaited_once()
+
+
+async def test_rotation_edits_status_during_long_silent_call():
+    """A long API call with no on_progress events must still rotate the status."""
+    import asyncio
+
+    update = _build_update(45)
+    status_msg = AsyncMock()
+    update.message.reply_text.return_value = status_msg
+
+    async def slow_agent_run(messages, on_progress=None):
+        await asyncio.sleep(0.2)
+        return AgentResponse(text="Odgovor. [CONF:NA]")
+
+    with (
+        patch("src.telegram_handler._STATUS_ROTATE_INTERVAL_S", 0.05),
+        patch("src.telegram_handler._STATUS_ROTATE_POLL_S", 0.01),
+        patch("src.telegram_handler.agent_run", side_effect=slow_agent_run),
+        patch("src.telegram_handler._send_long", new_callable=AsyncMock),
+        patch("src.telegram_handler._chat_history") as mock_history,
+    ):
+        from src.telegram_handler import message_handler
+        mock_history.__getitem__ = MagicMock(return_value=[])
+
+        await message_handler(update, MagicMock())
+
+    edited = [c.args[0] for c in status_msg.edit_text.await_args_list]
+    assert edited, "expected at least one rotation edit during the long call"
+    assert all(text in _STATUS_ROTATION for text in edited)
+    # consecutive edits never repeat the same text (would raise BadRequest)
+    for prev, curr in zip(edited, edited[1:]):
+        assert prev != curr
+    status_msg.delete.assert_awaited_once()
+
+
+async def test_no_rotation_for_fast_query():
+    """With the real 30s interval, a fast query gets no rotation edits."""
+    update = _build_update(46)
+    status_msg = AsyncMock()
+    update.message.reply_text.return_value = status_msg
+
+    with (
+        patch(
+            "src.telegram_handler.agent_run",
+            new_callable=AsyncMock,
+            return_value=AgentResponse(text="Odgovor. [CONF:NA]"),
+        ),
+        patch("src.telegram_handler._send_long", new_callable=AsyncMock),
+        patch("src.telegram_handler._chat_history") as mock_history,
+    ):
+        from src.telegram_handler import message_handler
+        mock_history.__getitem__ = MagicMock(return_value=[])
+
+        await message_handler(update, MagicMock())
+
+    status_msg.edit_text.assert_not_awaited()
     status_msg.delete.assert_awaited_once()
 
 

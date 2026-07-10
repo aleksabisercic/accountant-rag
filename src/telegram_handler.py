@@ -73,6 +73,17 @@ _STATUS_BY_TOOL = [
 ]
 _STATUS_DEFAULT = "✍️ Pripremam odgovor…"
 
+# Server-side tools (web_search, code_execution) run inside a single API call
+# and emit no on_progress events — rotate the status on a timer so a long
+# turn never looks frozen.
+_STATUS_ROTATION = [
+    "🔍 Prikupljam informacije…",
+    "🧮 Obrađujem podatke…",
+    "✍️ Pripremam odgovor…",
+]
+_STATUS_ROTATE_INTERVAL_S = 30
+_STATUS_ROTATE_POLL_S = 5
+
 
 def _status_for_tools(tools: list[str]) -> str:
     for tool, status in _STATUS_BY_TOOL:
@@ -1043,16 +1054,37 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         logger.warning("failed to send status message to %s", chat_id, exc_info=True)
 
     last_status = _STATUS_INITIAL
+    last_edit = time.monotonic()
 
-    async def on_progress(round_num: int, tools: list[str]) -> None:
-        nonlocal last_status
-        if status_msg is None:
-            return
-        text = _status_for_tools(tools)
-        if text == last_status:
+    async def _set_status(text: str) -> None:
+        nonlocal last_status, last_edit
+        if status_msg is None or text == last_status:
             return  # editing with identical text raises BadRequest
         last_status = text
+        last_edit = time.monotonic()
         await status_msg.edit_text(text)
+
+    async def on_progress(round_num: int, tools: list[str]) -> None:
+        await _set_status(_status_for_tools(tools))
+
+    async def rotate_status() -> None:
+        idx = 0
+        while True:
+            await asyncio.sleep(_STATUS_ROTATE_POLL_S)
+            if time.monotonic() - last_edit < _STATUS_ROTATE_INTERVAL_S:
+                continue
+            text = _STATUS_ROTATION[idx % len(_STATUS_ROTATION)]
+            idx += 1
+            if text == last_status:
+                text = _STATUS_ROTATION[idx % len(_STATUS_ROTATION)]
+                idx += 1
+            try:
+                await _set_status(text)
+            except Exception:
+                logger.warning("status rotation edit failed for %s", chat_id, exc_info=True)
+                return
+
+    rotate_task = asyncio.create_task(rotate_status()) if status_msg else None
 
     t0 = time.monotonic()
     try:
@@ -1112,6 +1144,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
     finally:
         typing_task.cancel()
+        if rotate_task is not None:
+            rotate_task.cancel()
         if status_msg is not None:
             try:
                 await status_msg.delete()
