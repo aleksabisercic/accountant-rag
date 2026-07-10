@@ -11,4 +11,3 @@ __pycache__/
 data/review/
 
 # Local-only (kept on disk, not published)
-CLAUDE.md
