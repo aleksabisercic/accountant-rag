@@ -40,7 +40,7 @@ from src.config import CONFIG, TELEGRAM_BOT_TOKEN
 from src.embeddings import embed_documents
 from src.contextualizer import contextualize_chunks
 from src.pdf_loader import ScannedPDFError, process_single_pdf_with_doc
-from src.vector_store import delete_stale_versions, upsert_chunks
+from src.vector_store import delete_stale_versions, delete_upload_version, upsert_chunks
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +146,11 @@ def _spawn(coro) -> asyncio.Task:
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
     return task
+
+
+# PyMuPDF is not thread-safe — concurrent admin uploads must not parse PDFs
+# in parallel worker threads (risk of interpreter crash).
+_pdf_parse_lock = asyncio.Lock()
 
 # Registration form state (in-memory, lost on restart — acceptable)
 _REG_ASK_NAME = "ask_name"
@@ -1144,16 +1149,20 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         # PDF parsing is CPU-bound — run it off the event loop so the bot
         # keeps answering messages and health checks during large uploads.
+        # PyMuPDF is not thread-safe, so concurrent uploads must not parse
+        # in parallel threads — serialize via the module-level lock.
         def _read_page_count() -> int:
             with pymupdf.open(pdf_path) as _pdf:
                 return _pdf.page_count
 
-        page_count = await asyncio.to_thread(_read_page_count)
+        async with _pdf_parse_lock:
+            page_count = await asyncio.to_thread(_read_page_count)
 
         try:
-            full_doc, chunks = await asyncio.to_thread(
-                process_single_pdf_with_doc, pdf_path
-            )
+            async with _pdf_parse_lock:
+                full_doc, chunks = await asyncio.to_thread(
+                    process_single_pdf_with_doc, pdf_path
+                )
         except ScannedPDFError:
             await update.message.reply_text(
                 f"❌ {safe_name} — skenirani PDF, potreban je tekstualni PDF"
@@ -1186,7 +1195,20 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         metadatas = [
             {**c["metadata"], "upload_version": upload_version} for c in chunks
         ]
-        count = await upsert_chunks(original_texts, vectors, metadatas)
+        try:
+            count = await upsert_chunks(original_texts, vectors, metadatas)
+        except Exception:
+            # Batched upsert can fail partway (quota, network) — sweep the
+            # incomplete new version so it doesn't linger as duplicate chunks
+            # eating quota. Deletes don't need free storage, so this works
+            # even when the failure was the quota itself.
+            try:
+                await delete_upload_version(safe_name, upload_version)
+            except Exception:
+                logger.exception(
+                    "Cleanup of partial upload %s (%s) failed", safe_name, upload_version
+                )
+            raise
         await delete_stale_versions(safe_name, upload_version)
 
         success_msg = f"✅ {safe_name} — {count} delova indeksirano"
