@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 MODEL = CONFIG["agent"]["model"]
 MAX_ROUNDS = CONFIG["agent"]["max_tool_rounds"]
 MAX_TOKENS = CONFIG["agent"].get("max_tokens", 8192)
+# low | medium | high | xhigh | max. Unset = API default (high).
+EFFORT = CONFIG["agent"].get("effort")
 SYSTEM_PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "system.txt"
 
 SEARCH_TOOL = {
@@ -115,6 +117,10 @@ async def run(messages: list[dict], on_progress=None) -> AgentResponse:
         {"type": "web_search_20260209", "name": "web_search", "max_uses": 3},
         {"type": "custom", **SEARCH_TOOL},
     ]
+    # Sent via extra_body rather than the typed output_config kwarg: requirements
+    # pin only anthropic>=0.40.0 and the prod image's pip layer is cached, so the
+    # installed SDK may predate output_config (unknown kwarg = TypeError on every call).
+    extra = {"extra_body": {"output_config": {"effort": EFFORT}}} if EFFORT else {}
 
     sources: list[Source] = []
     seen_sources: set[str] = set()
@@ -130,6 +136,7 @@ async def run(messages: list[dict], on_progress=None) -> AgentResponse:
             system=system,
             tools=tools,
             messages=messages,
+            **extra,
         )
 
         total_input += response.usage.input_tokens
