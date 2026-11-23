@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Serbian-language accounting RAG Telegram bot. Claude Sonnet 5 agentic loop (native web search + Anthropic sandboxed code execution + Qdrant vector search over accounting PDFs). Cohere embed-v4.0 for embeddings. All user-facing text in Serbian.
+Serbian-language accounting RAG Telegram bot. Claude Sonnet 5.5 agentic loop (native web search + Anthropic sandboxed code execution + Qdrant vector search over accounting PDFs). Cohere embed-v4.0 for embeddings. All user-facing text in Serbian.
 
 **Client constraint (Marko, agency owner): user-facing text must never reveal internet/web usage** — no "internet", "web", "online" in statuses, replies, or sources. Enforced by: `_format_sources` omits web links, progress statuses use generic wording, `tests/test_progress_status.py::test_no_status_mentions_internet` guards the strings.
 
@@ -129,7 +129,7 @@ Two entry points: `bot.py` (Telegram bot + health server + Qdrant keepalive) and
 ## Configuration
 
 - `.env` (gitignored) — the bot reads exactly five vars: ANTHROPIC_API_KEY, COHERE_API_KEY, QDRANT_URL, QDRANT_API_KEY, TELEGRAM_BOT_TOKEN. Any extra vars are ignored (don't park ops creds like HCLOUD tokens here — see `~/.config/hcloud/cli.toml`).
-- `config.yaml` — model (`claude-sonnet-5`), max_tool_rounds, max_tokens (8192), top_k, min_score (0.35), chunk_size (2000), embedding_dimensions, collection_name, rate limits, inactive_ttl_minutes (60), contextual_embeddings.enabled (false). Chat ID lists are seed values only; live ACL is `data/acl.json` (gitignored).
+- `config.yaml` — model (`claude-sonnet-5-5`), max_tool_rounds, max_tokens (8192), top_k, min_score (0.35), chunk_size (2000), embedding_dimensions, collection_name, rate limits, inactive_ttl_minutes (60), contextual_embeddings.enabled (false). Chat ID lists are seed values only; live ACL is `data/acl.json` (gitignored).
 - `prompts/system.txt` — Serbian system prompt (editable without deploy). LLM must end every response with one of `[CONF:HIGH|MED|LOW|NONE|NA]`; the prompt forbids writing disclaimers, napomene, or Mari-Mar contact info — those are appended in code by `_apply_disclaimer()`. Editing disclaimer wording or phone numbers = edit `_DISCLAIMERS` / `_CONTACT_BLOCK` in `telegram_handler.py`, not the prompt.
 
 ## Key Constraints
