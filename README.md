@@ -53,7 +53,7 @@ isn't sure.
 ```text
 PDF corpus ──ingest──▶ chunk + transliterate ──▶ Cohere embed-v4.0 ──▶ Qdrant
                                                                           │
-Telegram ──▶ Agent loop (Claude Sonnet 5) ────┬─ search_documents ────────┘
+Telegram ──▶ Agent loop (Claude Sonnet 5.5)───┬─ search_documents ────────┘
                                               ├─ web_search (native)
                                               └─ code execution (sandboxed)
 ```

@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Serbian-language accounting RAG Telegram bot. Claude Sonnet 5 agentic loop (native web search + Anthropic sandboxed code execution + Qdrant vector search over accounting PDFs). Cohere embed-v4.0 for embeddings. All user-facing text in Serbian.
+Serbian-language accounting RAG Telegram bot. Claude Sonnet 5.5 agentic loop (native web search + Anthropic sandboxed code execution + Qdrant vector search over accounting PDFs). Cohere embed-v4.0 for embeddings. All user-facing text in Serbian.
 
 **Client constraint (Marko, agency owner): user-facing text must never reveal internet/web usage** — no "internet", "web", "online" in statuses, replies, or sources. Enforced by: `_format_sources` omits web links, progress statuses use generic wording, `tests/test_progress_status.py::test_no_status_mentions_internet` guards the strings.
 
@@ -28,7 +28,7 @@ ssh deploy@178.105.109.233          # Prod server (non-root deploy user; root@ f
 Two entry points: `bot.py` (Telegram bot + health server + Qdrant keepalive) and `ingest.py` (batch PDF indexing). Deployed via Docker Compose.
 
 ### Agent (`src/agent.py`)
-- Claude tool-use loop, max rounds via `config.yaml` `agent.max_tool_rounds`, per-call `max_tokens` via `agent.max_tokens` (default 8192).
+- Claude tool-use loop, max rounds via `config.yaml` `agent.max_tool_rounds`, per-call `max_tokens` via `agent.max_tokens` (default 8192), effort via `agent.effort` (`output_config.effort`, passed through `extra_body` so an older cached SDK in the prod image can't TypeError on an unknown kwarg; unset = API default `high`).
 - Two declared tools: `search_documents` (custom: embed query via Cohere → Qdrant vector search) and `web_search` (`web_search_20260209`, Claude native, max 3 uses). Code execution is **auto-injected** by the API when `web_search_20260209` is present — do NOT declare it explicitly or the API returns 400 ("Auto-injecting tools would conflict with existing tool names"). The auto-injected code execution is general-purpose (math, data analysis), not limited to web search filtering. Free when paired with web_search.
 - `agent.run(messages, on_progress=None) → AgentResponse(text, sources, web_search_used, tools_used, input_tokens, output_tokens, rounds)`. Decoupled from frontend. `on_progress(round_num, tools_this_round)` is an optional async callback fired after each **non-terminal** round (drives Telegram status edits); callback errors are logged and never break the loop. Server-side tools in the final (`end_turn`) round produce NO progress event — they complete inside one API call (222s single-round turns observed in prod); the handler's rotation timer covers that gap.
 - Terminal stop reasons: `end_turn`, `max_tokens`, `refusal`, `stop_sequence`, `model_context_window_exceeded` — looping after any of these would resend a history ending on an assistant turn (API rejects as prefill). Empty text falls back to "Nisam uspeo da pronađem odgovor."
@@ -129,7 +129,7 @@ Two entry points: `bot.py` (Telegram bot + health server + Qdrant keepalive) and
 ## Configuration
 
 - `.env` (gitignored) — the bot reads exactly five vars: ANTHROPIC_API_KEY, COHERE_API_KEY, QDRANT_URL, QDRANT_API_KEY, TELEGRAM_BOT_TOKEN. Any extra vars are ignored (don't park ops creds like HCLOUD tokens here — see `~/.config/hcloud/cli.toml`).
-- `config.yaml` — model (`claude-sonnet-5`), max_tool_rounds, max_tokens (8192), top_k, min_score (0.35), chunk_size (2000), embedding_dimensions, collection_name, rate limits, inactive_ttl_minutes (60), contextual_embeddings.enabled (false). Chat ID lists are seed values only; live ACL is `data/acl.json` (gitignored).
+- `config.yaml` — model (`claude-sonnet-5-5`), max_tool_rounds, max_tokens (8192), effort (`medium`, sent via `extra_body` — see `src/agent.py`), top_k, min_score (0.35), chunk_size (2000), embedding_dimensions, collection_name, rate limits, inactive_ttl_minutes (60), contextual_embeddings.enabled (false). Chat ID lists are seed values only; live ACL is `data/acl.json` (gitignored).
 - `prompts/system.txt` — Serbian system prompt (editable without deploy). LLM must end every response with one of `[CONF:HIGH|MED|LOW|NONE|NA]`; the prompt forbids writing disclaimers, napomene, or Mari-Mar contact info — those are appended in code by `_apply_disclaimer()`. Editing disclaimer wording or phone numbers = edit `_DISCLAIMERS` / `_CONTACT_BLOCK` in `telegram_handler.py`, not the prompt.
 
 ## Key Constraints
@@ -153,6 +153,7 @@ Two entry points: `bot.py` (Telegram bot + health server + Qdrant keepalive) and
 - `tests/test_questions_digest.py`: `get_recent_questions` window filtering, `_format_questions_digest` (HTML escape, truncation, named/unknown users), `_format_questions_digest_plain` (no HTML), `pitanja_handler` chat-history injection (default days, no injection on fetch error).
 - `tests/test_progress_status.py`: status↔tool mapping, no-internet-wording guard, `on_progress` invocation + error resilience, status message lifecycle (sent → edited → deleted, deleted on agent failure, answer survives status-send failure), 30s rotation fires on long silent calls and never on fast queries.
 - `tests/test_history_trim.py`: trimmed history never starts with an assistant turn.
+- `tests/test_agent_effort.py`: `agent.effort` is forwarded as `extra_body.output_config.effort` (never the typed kwarg), nothing sent when unset, shipped config is `medium`.
 
 ## Known Issues
 
